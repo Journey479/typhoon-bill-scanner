@@ -1,0 +1,307 @@
+// =============================================================================
+// code.gs.template — Apps Script (Telegram webhook) ฉบับ CLOUD RUN — เทมเพลตไม่มีความลับ
+// วิธีใช้: คัดลอกเนื้อหานี้ไปวางใน Apps Script editor ของบอท แล้วเติมค่า PUT-YOUR-... ให้ครบ
+//   - เมื่อมีไฟล์ใหม่เข้า Inbox จะ "ยิง" Cloud Run ให้ประมวลผลทันที (event-driven)
+//   - มีคำสั่ง autorun:on / autorun:off เหมือนเวอร์ชันอื่น
+// (ไฟล์จริงที่เติมค่าแล้วให้ตั้งชื่อ code.gs — ถูก .gitignore กันไว้ ไม่หลุดขึ้น repo)
+// =============================================================================
+
+// =========================
+// CONFIG — เติมค่าให้ครบ
+// =========================
+const TELEGRAM_TOKEN       = "PUT-YOUR-TELEGRAM-BOT-TOKEN";
+const INBOX_FOLDER_ID      = "PUT-YOUR-INBOX-FOLDER-ID";
+const PROCESSING_FOLDER_ID = "PUT-YOUR-PROCESSING-FOLDER-ID";
+const SUCCESS_FOLDER_ID    = "PUT-YOUR-SUCCESS-FOLDER-ID";
+const ERROR_FOLDER_ID      = "PUT-YOUR-ERROR-FOLDER-ID";
+const SPREADSHEET_ID       = "PUT-YOUR-SPREADSHEET-ID";
+
+// --- Cloud Run: URL ของ service หลัง deploy + โทเคนกันคนนอกยิง (ต้องตรงกับ TRIGGER_TOKEN ใน env.yaml) ---
+// เอา URL จากผลลัพธ์ตอน `gcloud run deploy` (เช่น https://docscan-xxxx-as.a.run.app)
+const CLOUD_RUN_URL   = "https://PUT-YOUR-CLOUD-RUN-URL-HERE.a.run.app";
+const TRIGGER_TOKEN   = "PUT-YOUR-SHARED-SECRET-HERE";   // สุ่มยาว ๆ แล้วตั้งให้ตรงกับฝั่ง Cloud Run
+
+// ไฟล์สถานะ autorun — ต้องตรงกับ CloudRun/main.py (STATE_FOLDER_ID + AUTORUN_FILE)
+const STATE_FOLDER_ID = SUCCESS_FOLDER_ID;   // เก็บใน Success เพราะ worker ไม่สแกนโฟลเดอร์นี้
+const AUTORUN_FILE    = "_autorun_state.txt";
+
+// =========================
+// WEBHOOK
+// =========================
+function doPost(e) {
+  try {
+    if (!e || !e.postData || !e.postData.contents) {
+      return HtmlService.createHtmlOutput("NO_DATA");
+    }
+
+    const data = JSON.parse(e.postData.contents);
+    const message = data.message;
+    if (!message) {
+      return HtmlService.createHtmlOutput("NO_MESSAGE");
+    }
+
+    // --- กัน Telegram ส่ง update เดิมซ้ำ ---
+    const updateId = data.update_id;
+    if (updateId != null) {
+      const cache = CacheService.getScriptCache();
+      const key = "u_" + updateId;
+      if (cache.get(key)) {
+        return HtmlService.createHtmlOutput("DUPLICATE");
+      }
+      cache.put(key, "1", 21600);
+    }
+
+    const chatId = message.chat.id;
+    const cmd = (message.text || "").trim().toLowerCase().replace(/^\//, "");
+
+    // --- คำสั่งควบคุม AUTORUN ---
+    if (cmd === "autorun:on") {
+      setAutorun("on");
+      sendMessage(chatId, "🟢 เปิด autorun แล้ว — ไฟล์ใหม่จะถูกประมวลผลอัตโนมัติบน Cloud Run");
+      return HtmlService.createHtmlOutput("OK");
+    }
+    if (cmd === "autorun:off") {
+      setAutorun("off");
+      sendMessage(chatId, "🔴 ปิด autorun แล้ว — Cloud Run จะข้ามการประมวลผล (ไฟล์ยังเข้า Inbox ปกติ)");
+      return HtmlService.createHtmlOutput("OK");
+    }
+    if (cmd === "autorun" || cmd === "autorun:status") {
+      sendMessage(chatId, "ℹ️ สถานะ autorun ปัจจุบัน: " + getAutorun().toUpperCase());
+      return HtmlService.createHtmlOutput("OK");
+    }
+
+    // --- สั่งประมวลผลเดี๋ยวนี้ (เผื่อมีไฟล์ค้าง อยากให้รันเลยไม่ต้องอัปโหลดใหม่) ---
+    // force=true → บังคับประมวลผลแม้ autorun=off + แจ้งกลับแม้ Inbox ว่าง
+    if (cmd === "run" || cmd === "scan") {
+      // ส่ง ack ก่อน แล้วค่อยยิง Cloud Run — เพราะ UrlFetchApp.fetch บล็อกรอจนประมวลผลเสร็จ
+      // (ถ้ายิงก่อน ack จะมาทีหลังผล ✅ เสมอ)
+      sendMessage(chatId, "🚀 สั่งให้ Cloud Run ประมวลผลไฟล์ใน Inbox แล้ว");
+      triggerCloudRun(true);
+      return HtmlService.createHtmlOutput("OK");
+    }
+
+    // --- คำสั่งสั่งงานผ่าน Telegram (เหมือนตัวเสถียร) ---
+    if (cmd === "id") {
+      sendMessage(chatId, "🆔 chat id ของแชตนี้คือ: " + chatId);
+      return HtmlService.createHtmlOutput("OK");
+    }
+    if (cmd === "help" || cmd === "start") {
+      sendMessage(chatId, buildHelp());
+      return HtmlService.createHtmlOutput("OK");
+    }
+    if (cmd === "show") {
+      sendMessage(chatId, buildShowReport());
+      return HtmlService.createHtmlOutput("OK");
+    }
+    if (cmd === "sh") {
+      sendMessage(chatId, "📄 Google Sheet:\n" + sheetUrl());
+      return HtmlService.createHtmlOutput("OK");
+    }
+    if (cmd === "link") {
+      sendMessage(chatId, buildLinks());
+      return HtmlService.createHtmlOutput("OK");
+    }
+    if (cmd === "mvp") {
+      const n = moveAllFiles(PROCESSING_FOLDER_ID, INBOX_FOLDER_ID);
+      sendMessage(chatId, n > 0
+        ? "🔄 ดึงจาก Processing กลับเข้า Inbox แล้ว " + n + " ไฟล์"
+        : "✨ ไม่มีไฟล์ค้างใน Processing");
+      return HtmlService.createHtmlOutput("OK");
+    }
+    if (cmd === "mve") {
+      const np = moveAllFiles(PROCESSING_FOLDER_ID, INBOX_FOLDER_ID);
+      const ne = moveAllFiles(ERROR_FOLDER_ID, INBOX_FOLDER_ID);
+      sendMessage(chatId,
+        "🔄 ดึงไฟล์กลับเข้า Inbox เรียบร้อย\n" +
+        "⚡ Processing: " + np + " ไฟล์\n" +
+        "❌ Error: " + ne + " ไฟล์\n" +
+        "✅ รวม " + (np + ne) + " ไฟล์");
+      return HtmlService.createHtmlOutput("OK");
+    }
+
+    let fileId = null;
+    let originalName = null;
+
+    if (message.photo) {
+      const photo = message.photo[message.photo.length - 1];
+      fileId = photo.file_id;
+    } else if (message.document) {
+      fileId = message.document.file_id;
+      originalName = message.document.file_name;
+    }
+
+    if (fileId) {
+      const savedName = saveFile(fileId, originalName);
+      sendMessage(chatId, "✅ อัพโหลดสำเร็จ: " + savedName);
+      // 🚀 มีไฟล์ใหม่เข้า Inbox -> ยิงให้ Cloud Run ประมวลผลทันที (event-driven)
+      triggerCloudRun();
+    } else {
+      sendMessage(chatId, "⚠️ ไม่เข้าใจคำสั่ง — พิมพ์ help เพื่อดูคำสั่งทั้งหมด หรือส่งรูป/ไฟล์เพื่ออัปโหลด");
+    }
+
+    return HtmlService.createHtmlOutput("OK");
+  } catch (err) {
+    Logger.log(err);
+    return HtmlService.createHtmlOutput("ERROR: " + err);
+  }
+}
+
+// =========================
+// ยิง Cloud Run ให้เริ่มประมวลผล (ไม่รอผล — กันไม่ให้ webhook ค้างจน Telegram ส่งซ้ำ)
+// =========================
+function triggerCloudRun(force) {
+  if (!CLOUD_RUN_URL || CLOUD_RUN_URL.indexOf("PUT-YOUR") !== -1) {
+    Logger.log("CLOUD_RUN_URL ยังไม่ได้ตั้งค่า — ข้ามการยิง");
+    return;
+  }
+  try {
+    let url = CLOUD_RUN_URL + "?token=" + encodeURIComponent(TRIGGER_TOKEN);
+    if (force) url += "&force=1";   // คำสั่ง run/scan: บังคับประมวลผลแม้ autorun=off
+    UrlFetchApp.fetch(url, {
+      method: "get",
+      muteHttpExceptions: true,
+      // ไม่ตามผลลัพธ์ — แค่ปลุก Cloud Run พอ (ผลแจ้งกลับทาง Telegram จาก main.py เอง)
+      followRedirects: true,
+    });
+  } catch (err) {
+    Logger.log("triggerCloudRun error: " + err);
+  }
+}
+
+// =========================
+// AUTORUN STATE (เขียน/อ่านไฟล์สถานะบน Drive ให้ Cloud Run ใช้)
+// =========================
+function setAutorun(state) {
+  const folder = DriveApp.getFolderById(STATE_FOLDER_ID);
+  const old = folder.getFilesByName(AUTORUN_FILE);
+  while (old.hasNext()) old.next().setTrashed(true);
+  folder.createFile(AUTORUN_FILE, state, MimeType.PLAIN_TEXT);
+}
+
+function getAutorun() {
+  const folder = DriveApp.getFolderById(STATE_FOLDER_ID);
+  const files = folder.getFilesByName(AUTORUN_FILE);
+  if (files.hasNext()) {
+    return (files.next().getBlob().getDataAsString() || "on").trim().toLowerCase();
+  }
+  return "on";
+}
+
+// =========================
+// SAVE FILE TO DRIVE
+// =========================
+function saveFile(fileId, originalName) {
+  const fileInfo = JSON.parse(
+    UrlFetchApp.fetch(
+      `https://api.telegram.org/bot${TELEGRAM_TOKEN}/getFile?file_id=${fileId}`
+    ).getContentText()
+  );
+
+  const filePath = fileInfo.result.file_path;
+  const downloadUrl = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${filePath}`;
+  const blob = UrlFetchApp.fetch(downloadUrl).getBlob();
+
+  const timestamp = Utilities.formatDate(
+    new Date(),
+    Session.getScriptTimeZone(),
+    "yyyyMMdd_HHmmss"
+  );
+
+  let ext = "";
+  const source = originalName || filePath || "";
+  const dot = source.lastIndexOf(".");
+  if (dot !== -1) ext = source.substring(dot);
+
+  const name = `receipt_${timestamp}${ext}`;
+  blob.setName(name);
+
+  DriveApp.getFolderById(INBOX_FOLDER_ID).createFile(blob);
+  return name;
+}
+
+// =========================
+// COMMANDS (show / mvp / mve / sh / link / help)
+// =========================
+function countFiles(folderId) {
+  const files = DriveApp.getFolderById(folderId).getFiles();
+  let n = 0;
+  while (files.hasNext()) { files.next(); n++; }
+  return n;
+}
+
+function moveAllFiles(srcFolderId, destFolderId) {
+  const dest = DriveApp.getFolderById(destFolderId);
+  const files = DriveApp.getFolderById(srcFolderId).getFiles();
+  let n = 0;
+  while (files.hasNext()) {
+    files.next().moveTo(dest);
+    n++;
+  }
+  return n;
+}
+
+function getSuccessMonthInfo() {
+  const monthStr = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM");
+  const subs = DriveApp.getFolderById(SUCCESS_FOLDER_ID).getFoldersByName(monthStr);
+  let count = 0;
+  if (subs.hasNext()) {
+    const files = subs.next().getFiles();
+    while (files.hasNext()) { files.next(); count++; }
+  }
+  return { month: monthStr, count: count };
+}
+
+function sheetUrl() {
+  return "https://docs.google.com/spreadsheets/d/" + SPREADSHEET_ID + "/edit";
+}
+function folderUrl(folderId) {
+  return "https://drive.google.com/drive/folders/" + folderId;
+}
+
+function buildLinks() {
+  return "🔗 ลิงก์เปิดทั้งหมด\n" +
+         "📄 Sheet: " + sheetUrl() + "\n" +
+         "📥 Inbox: " + folderUrl(INBOX_FOLDER_ID) + "\n" +
+         "⚡ Processing: " + folderUrl(PROCESSING_FOLDER_ID) + "\n" +
+         "✅ Success: " + folderUrl(SUCCESS_FOLDER_ID) + "\n" +
+         "❌ Error: " + folderUrl(ERROR_FOLDER_ID);
+}
+
+function buildShowReport() {
+  const s = getSuccessMonthInfo();
+  return "📊 รายงานไฟล์ใน Google Drive\n" +
+         "📥 Inbox: " + countFiles(INBOX_FOLDER_ID) + " ไฟล์\n" +
+         "⚡ Processing: " + countFiles(PROCESSING_FOLDER_ID) + " ไฟล์\n" +
+         "❌ Error: " + countFiles(ERROR_FOLDER_ID) + " ไฟล์\n" +
+         "✅ Success (" + s.month + "): " + s.count + " ไฟล์";
+}
+
+function buildHelp() {
+  return "📖 คำสั่งที่ใช้ได้ (ฉบับ Cloud Run):\n" +
+         "📤 ส่งรูป/ไฟล์ → อัปโหลดเข้า Inbox แล้วยิง Cloud Run ประมวลผลทันที\n" +
+         "🚀 run → สั่งประมวลผลไฟล์ค้างใน Inbox เดี๋ยวนี้\n" +
+         "🟢 autorun:on → เปิดให้ Cloud Run ประมวลผล\n" +
+         "🔴 autorun:off → ปิดการประมวลผล (ไฟล์ยังเข้า Inbox)\n" +
+         "ℹ️ autorun:status → ดูสถานะ autorun ปัจจุบัน\n" +
+         "🆔 id → ดูเลข chat id ของแชตนี้\n" +
+         "📊 show → เช็คจำนวนไฟล์ค้าง (Inbox/Processing/Error/Success)\n" +
+         "📄 sh → ลิงก์เปิด Google Sheet\n" +
+         "🔗 link → ลิงก์เปิดทุกที่ (Sheet + ทุกโฟลเดอร์)\n" +
+         "🔄 mvp → ดึงไฟล์จาก Processing กลับเข้า Inbox\n" +
+         "🔄 mve → ดึงไฟล์จาก Error + Processing กลับเข้า Inbox\n" +
+         "📖 help → แสดงคำสั่งทั้งหมด";
+}
+
+// =========================
+// ตอบกลับ Telegram
+// =========================
+function sendMessage(chatId, text) {
+  UrlFetchApp.fetch(
+    `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
+    {
+      method: "post",
+      payload: { chat_id: String(chatId), text: text },
+      muteHttpExceptions: true
+    }
+  );
+}
