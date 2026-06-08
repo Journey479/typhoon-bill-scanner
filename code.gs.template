@@ -7,23 +7,47 @@
 // =============================================================================
 
 // =========================
-// CONFIG — เติมค่าให้ครบ
+// CONFIG — อ่านจาก Script Properties (Project Settings → Script properties)
+// ไม่มีความลับฝังในไฟล์นี้ -> commit ขึ้น git ได้ปลอดภัย
+// ตั้งค่าครั้งแรก: เติมค่าใน setupProperties() ด้านล่างแล้วรันหนึ่งครั้ง (หรือกรอกมือในหน้า Project Settings)
 // =========================
-const TELEGRAM_TOKEN       = "PUT-YOUR-TELEGRAM-BOT-TOKEN";
-const INBOX_FOLDER_ID      = "PUT-YOUR-INBOX-FOLDER-ID";
-const PROCESSING_FOLDER_ID = "PUT-YOUR-PROCESSING-FOLDER-ID";
-const SUCCESS_FOLDER_ID    = "PUT-YOUR-SUCCESS-FOLDER-ID";
-const ERROR_FOLDER_ID      = "PUT-YOUR-ERROR-FOLDER-ID";
-const SPREADSHEET_ID       = "PUT-YOUR-SPREADSHEET-ID";
+const PROPS = PropertiesService.getScriptProperties();
+function cfg(key) { return PROPS.getProperty(key) || ""; }
+
+const TELEGRAM_TOKEN       = cfg("TELEGRAM_TOKEN");
+const INBOX_FOLDER_ID      = cfg("FOLDER_INBOX");
+const PROCESSING_FOLDER_ID = cfg("FOLDER_PROCESSING");
+const SUCCESS_FOLDER_ID    = cfg("FOLDER_SUCCESS");
+const ERROR_FOLDER_ID      = cfg("FOLDER_ERROR");
+const SPREADSHEET_ID       = cfg("SPREADSHEET_ID");
 
 // --- Cloud Run: URL ของ service หลัง deploy + โทเคนกันคนนอกยิง (ต้องตรงกับ TRIGGER_TOKEN ใน env.yaml) ---
-// เอา URL จากผลลัพธ์ตอน `gcloud run deploy` (เช่น https://docscan-xxxx-as.a.run.app)
-const CLOUD_RUN_URL   = "https://PUT-YOUR-CLOUD-RUN-URL-HERE.a.run.app";
-const TRIGGER_TOKEN   = "PUT-YOUR-SHARED-SECRET-HERE";   // สุ่มยาว ๆ แล้วตั้งให้ตรงกับฝั่ง Cloud Run
+const CLOUD_RUN_URL   = cfg("CLOUD_RUN_URL");
+const TRIGGER_TOKEN   = cfg("TRIGGER_TOKEN");
 
 // ไฟล์สถานะ autorun — ต้องตรงกับ CloudRun/main.py (STATE_FOLDER_ID + AUTORUN_FILE)
 const STATE_FOLDER_ID = SUCCESS_FOLDER_ID;   // เก็บใน Success เพราะ worker ไม่สแกนโฟลเดอร์นี้
 const AUTORUN_FILE    = "_autorun_state.txt";
+const CHATS_FILE      = "_telegram_chats.txt";   // allowlist: chat id ที่อนุมัติ (main.py broadcast เฉพาะรายชื่อนี้)
+const ADMIN_CHAT_IDS  = cfg("ADMIN_CHAT_IDS");   // แอดมิน (คั่นด้วย ,) — เพิ่ม/ถอนสิทธิ์ได้ และรับ broadcast เสมอ
+
+// =========================
+// SETUP — เติมค่าจริงแล้วรันครั้งเดียวเพื่อบันทึกเข้า Script Properties (จากนั้นลบค่าออกได้)
+// (หรือกรอกมือที่ Project Settings → Script properties ก็ได้ ไม่ต้องใช้ฟังก์ชันนี้)
+// =========================
+function setupProperties() {
+  PropertiesService.getScriptProperties().setProperties({
+    TELEGRAM_TOKEN:    "PUT-YOUR-TELEGRAM-BOT-TOKEN",
+    FOLDER_INBOX:      "PUT-YOUR-INBOX-FOLDER-ID",
+    FOLDER_PROCESSING: "PUT-YOUR-PROCESSING-FOLDER-ID",
+    FOLDER_SUCCESS:    "PUT-YOUR-SUCCESS-FOLDER-ID",
+    FOLDER_ERROR:      "PUT-YOUR-ERROR-FOLDER-ID",
+    SPREADSHEET_ID:    "PUT-YOUR-SPREADSHEET-ID",
+    CLOUD_RUN_URL:     "https://PUT-YOUR-CLOUD-RUN-URL-HERE.a.run.app",
+    TRIGGER_TOKEN:     "PUT-YOUR-SHARED-SECRET-HERE",
+    ADMIN_CHAT_IDS:    "PUT-YOUR-ADMIN-CHAT-ID",
+  });
+}
 
 // =========================
 // WEBHOOK
@@ -52,7 +76,28 @@ function doPost(e) {
     }
 
     const chatId = message.chat.id;
-    const cmd = (message.text || "").trim().toLowerCase().replace(/^\//, "");
+    const rawText = (message.text || "").trim();
+    const cmd = rawText.toLowerCase().replace(/^\//, "");
+
+    // --- allowlist: เฉพาะแอดมิน/แชทที่อนุมัติเท่านั้นจึงใช้บอทได้ (กันคนนอกเห็นข้อมูลบิล) ---
+    if (!isAuthorized(chatId)) {
+      sendMessage(chatId,
+        "⛔ แชทนี้ยังไม่ได้รับอนุญาตให้ใช้งานบอท\n" +
+        "🆔 chat id ของคุณคือ: " + chatId + "\n" +
+        "โปรดแจ้งแอดมินให้เพิ่มสิทธิ์ด้วยคำสั่ง:  allow " + chatId);
+      return HtmlService.createHtmlOutput("UNAUTHORIZED");
+    }
+    if (isAdmin(chatId)) {
+      ensureAllowed(chatId);   // แอดมินรับ broadcast ด้วย
+      if (cmd.indexOf("allow") === 0 || cmd.indexOf("revoke") === 0) {
+        handleAccessCommand(chatId, rawText);
+        return HtmlService.createHtmlOutput("OK");
+      }
+      if (cmd === "chats") {
+        sendMessage(chatId, buildChatsReport());
+        return HtmlService.createHtmlOutput("OK");
+      }
+    }
 
     // --- คำสั่งควบคุม AUTORUN ---
     if (cmd === "autorun:on") {
@@ -178,6 +223,61 @@ function setAutorun(state) {
   folder.createFile(AUTORUN_FILE, state, MimeType.PLAIN_TEXT);
 }
 
+// =========================
+// TELEGRAM ALLOWLIST — เฉพาะแอดมิน/แชทที่อนุมัติเท่านั้นใช้บอท + รับ broadcast (กันข้อมูลบิลรั่ว)
+// _telegram_chats.txt = รายชื่อ chat id ที่อนุมัติ (main.py อ่านไป broadcast)
+// =========================
+function getAdminIds() {
+  return String(ADMIN_CHAT_IDS || "").split(/[\s,]+/).filter(String);
+}
+function isAdmin(chatId) {
+  return getAdminIds().indexOf(String(chatId)) !== -1;
+}
+function getAllowlist() {
+  const files = DriveApp.getFolderById(STATE_FOLDER_ID).getFilesByName(CHATS_FILE);
+  if (!files.hasNext()) return [];
+  return files.next().getBlob().getDataAsString().split(/[\s,]+/).filter(String);
+}
+function isAuthorized(chatId) {
+  const id = String(chatId);
+  return isAdmin(id) || getAllowlist().indexOf(id) !== -1;
+}
+function setAllowlist(list) {
+  const content = Array.from(new Set(list.filter(String))).join("\n");
+  const folder = DriveApp.getFolderById(STATE_FOLDER_ID);
+  const files = folder.getFilesByName(CHATS_FILE);
+  if (files.hasNext()) files.next().setContent(content);
+  else folder.createFile(CHATS_FILE, content, MimeType.PLAIN_TEXT);
+}
+function ensureAllowed(chatId) {
+  const id = String(chatId);
+  const list = getAllowlist();
+  if (list.indexOf(id) === -1) { list.push(id); setAllowlist(list); }
+}
+function handleAccessCommand(adminChatId, rawText) {
+  const parts = rawText.replace(/^\//, "").split(/\s+/);
+  const action = (parts[0] || "").toLowerCase();
+  const target = (parts[1] || "").trim();
+  if (!/^-?\d+$/.test(target)) {
+    sendMessage(adminChatId, "ℹ️ ใช้:  " + action + " <chat id>\nเช่น  " + action + " 123456789");
+    return;
+  }
+  let list = getAllowlist();
+  if (action === "allow") {
+    if (list.indexOf(target) === -1) list.push(target);
+    setAllowlist(list);
+    sendMessage(adminChatId, "✅ อนุมัติแชท " + target + " แล้ว");
+    sendMessage(target, "🎉 คุณได้รับอนุญาตให้ใช้บอทแล้ว — พิมพ์ help เพื่อเริ่มต้น");
+  } else {   // revoke
+    setAllowlist(list.filter(function (x) { return x !== target; }));
+    sendMessage(adminChatId, "🚫 ถอนสิทธิ์แชท " + target + " แล้ว");
+  }
+}
+function buildChatsReport() {
+  return "👮 แอดมิน: " + (getAdminIds().join(", ") || "-") + "\n" +
+         "✅ แชทที่อนุมัติ: " + (getAllowlist().join(", ") || "-");
+}
+
 function getAutorun() {
   const folder = DriveApp.getFolderById(STATE_FOLDER_ID);
   const files = folder.getFilesByName(AUTORUN_FILE);
@@ -289,7 +389,11 @@ function buildHelp() {
          "🔗 link → ลิงก์เปิดทุกที่ (Sheet + ทุกโฟลเดอร์)\n" +
          "🔄 mvp → ดึงไฟล์จาก Processing กลับเข้า Inbox\n" +
          "🔄 mve → ดึงไฟล์จาก Error + Processing กลับเข้า Inbox\n" +
-         "📖 help → แสดงคำสั่งทั้งหมด";
+         "📖 help → แสดงคำสั่งทั้งหมด\n" +
+         "— (แอดมิน) —\n" +
+         "✅ allow <chat id> → อนุมัติแชทใหม่\n" +
+         "🚫 revoke <chat id> → ถอนสิทธิ์แชท\n" +
+         "👥 chats → ดูรายชื่อแอดมิน/แชทที่อนุมัติ";
 }
 
 // =========================

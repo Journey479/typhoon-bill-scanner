@@ -1,0 +1,24 @@
+# =============================================================================
+# .gitignore — กันไฟล์ความลับ/สถานะ ไม่ให้หลุดขึ้น git
+# commit เฉพาะไฟล์ *.example.yaml / *.template ที่ไม่มีค่าจริง
+# =============================================================================
+
+# --- ความลับ: ค่าจริงทั้งหมด (มี API key / token / project id) ---
+env.yaml
+.env
+.env.*
+!.env.example
+
+# --- code.gs ตัวจริง (commit เฉพาะ code.gs.template) ---
+code.gs
+
+# --- Service-account JSON keys (ความลับร้ายแรง — ห้าม commit เด็ดขาด) ---
+**/config/*.json
+*.iam.gserviceaccount.com.json
+
+# --- Python / Cloud Run build ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.log

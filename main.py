@@ -22,7 +22,7 @@ deploy ด้วย `gcloud run deploy --source .` แล้ว buildpacks ส�
 import io
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 import requests
@@ -33,7 +33,17 @@ from openai import OpenAI
 
 import google.auth
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+
+# Google Vision + Gemini SDK (ออปชัน — ถ้าไม่ได้ติดตั้ง/ไม่ตั้งคีย์ จะใช้ Typhoon ล้วน)
+try:
+    from google.cloud import vision
+    from google import genai
+    from google.genai import types
+    _GOOGLE_SDK_OK = True
+except ImportError:
+    vision = genai = types = None
+    _GOOGLE_SDK_OK = False
 
 
 # ==============================================================================
@@ -45,6 +55,25 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 # โทเคนกันคนนอกยิง endpoint มั่ว — ต้องตรงกับ TRIGGER_TOKEN ใน code.gs (ตั้งผ่าน env)
 TRIGGER_TOKEN = os.getenv("TRIGGER_TOKEN", "").strip()
+
+# --- Google Vision + Gemini (เครื่องยนต์หลัก ใช้โควตาฟรีก่อน แล้วค่อย fallback ไป Typhoon) ---
+# Vision OCR ใช้สิทธิ์ Service Account ที่แนบกับ Cloud Run (ADC) — ต้องเปิด Cloud Vision API + Billing
+# Gemini ใช้ API key จาก Google AI Studio (โควตาฟรีรายวันต่อ key)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODELS = {
+    "flash":      os.getenv("GEMINI_FLASH_MODEL", "gemini-2.5-flash"),
+    "flash_lite": os.getenv("GEMINI_FLASH_LITE_MODEL", "gemini-2.5-flash-lite"),
+}
+# โควตาฟรีต่อโมเดลต่อวัน (2 โมเดล = 40 ไฟล์/วัน) แล้วรีเซ็ตตอน RESET_HOUR ทุกวัน
+GEMINI_DAILY_LIMIT = int(os.getenv("GEMINI_DAILY_LIMIT_PER_MODEL", "20"))
+QUOTA_RESET_HOUR = int(os.getenv("GOOGLE_QUOTA_RESET_HOUR", "7"))   # 07:00 น.
+QUOTA_TZ_OFFSET = int(os.getenv("GOOGLE_QUOTA_TZ_OFFSET", "7"))     # เขตเวลา (ไทย = UTC+7)
+# เพดาน Vision OCR ต่อเดือน — กันทะลุโควตาฟรี (Vision ฟรี 1000 หน้า/เดือน) ครบแล้วสลับไป Typhoon
+VISION_MONTHLY_LIMIT = int(os.getenv("VISION_MONTHLY_LIMIT", "1000"))
+
+# client ของ Gemini (สร้างครั้งเดียว) — None = ปิดเครื่องยนต์ Google
+client_gemini = genai.Client(api_key=GEMINI_API_KEY) if (GEMINI_API_KEY and _GOOGLE_SDK_OK) else None
+GOOGLE_ENABLED = client_gemini is not None
 
 # --- ค่าที่ไม่ลับ (เติมไว้ให้จากโปรเจกต์เดิม override ด้วย env ได้) ---
 TYPHOON_BASE_URL = os.getenv("TYPHOON_BASE_URL", "https://api.opentyphoon.ai/v1")
@@ -67,11 +96,14 @@ FOLDER_ERROR = os.getenv("FOLDER_ERROR", "")
 # โฟลเดอร์เก็บไฟล์สถานะ autorun (ต้องตรงกับ code.gs) — ใช้ Success เพราะ worker ไม่สแกน
 STATE_FOLDER_ID = FOLDER_SUCCESS
 AUTORUN_FILE = "_autorun_state.txt"
+GOOGLE_USAGE_FILE = "_google_usage.json"   # ตัวนับโควตา Gemini ต่อวัน (รีเซ็ตตอน 07:00)
+CHATS_FILE = "_telegram_chats.txt"         # รายชื่อ chat id (code.gs เขียน, worker อ่านไป broadcast)
 DEFAULT_AUTORUN = os.getenv("DEFAULT_AUTORUN", "on")  # ถ้ายังไม่มีไฟล์สถานะ ให้ถือว่าเปิด
 
 SCOPES = [
     "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/cloud-platform",   # สำหรับเรียก Cloud Vision API ด้วย SA
 ]
 
 HEADERS = [
@@ -122,7 +154,7 @@ class BillVerification(BaseModel):
     note: Optional[str] = Field(None)
 
 
-TYPHOON_PROMPT = """
+_BASE_PROMPT = """
 คุณคือผู้เชี่ยวชาญสกัดข้อมูลจากเอกสารบัญชีไทย ข้อความด้านล่างมาจากการ OCR เอกสาร 1 ใบ (อาจมีตัวอักษรเพี้ยน บรรทัดสลับ หรือ noise)
 ตีความอย่างรอบคอบแล้วสกัดข้อมูลตามกฎต่อไปนี้
 
@@ -149,9 +181,10 @@ TYPHOON_PROMPT = """
   "buyer_name": "string|null", "buyer_address": "string|null", "items_summary": "string|null",
   "subtotal": number|null, "vat": number|null, "total": number|null, "confidence": integer 0-100|null, "note": "string|null"
 }
-
---- ข้อความ OCR จากเอกสาร ---
 """
+
+# ใช้ต่อท้ายด้วยข้อความ OCR (ใช้ได้ทั้ง Typhoon OCR และ Google Vision OCR)
+TYPHOON_PROMPT = _BASE_PROMPT + "\n--- ข้อความ OCR จากเอกสาร ---\n"
 
 
 def _parse_json_object(raw_text):
@@ -291,18 +324,97 @@ def read_autorun_state(drive_service):
 
 
 # ==============================================================================
-# TELEGRAM
+# GOOGLE QUOTA STATE (ตัวนับ Gemini ต่อวัน — เก็บเป็น JSON บน Drive, รีเซ็ตตอน 07:00)
 # ==============================================================================
-def notify_telegram(text):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
+def _quota_day():
+    """วันโควตาปัจจุบัน (รอบใหม่เริ่มตอน QUOTA_RESET_HOUR ตามเขตเวลา QUOTA_TZ_OFFSET)
+    ไทย UTC+7 + reset 07:00  ->  ตรงกับเที่ยงคืน UTC พอดี"""
+    shifted = datetime.utcnow() + timedelta(hours=QUOTA_TZ_OFFSET - QUOTA_RESET_HOUR)
+    return shifted.strftime("%Y-%m-%d")
+
+
+def read_google_usage(drive_service):
+    """อ่านตัวนับ Gemini รายวัน {flash, flash_lite} + Vision รายเดือน {vision_count}
+    คนละวัน -> รีเซ็ต Gemini ; คนละเดือน -> รีเซ็ต Vision. เก็บ _id ไว้เขียนทับ"""
+    day = _quota_day()
+    month = datetime.utcnow().strftime("%Y-%m")   # Vision คิดตามเดือนปฏิทิน (billing)
+    base = {"date": day, "flash": 0, "flash_lite": 0,
+            "vision_month": month, "vision_count": 0, "_id": None}
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": "true"},
-            timeout=15)
+        q = f"name = '{GOOGLE_USAGE_FILE}' and '{STATE_FOLDER_ID}' in parents and trashed = false"
+        files = drive_service.files().list(
+            q=q, fields="files(id)", orderBy="modifiedTime desc").execute().get("files", [])
+        if files:
+            base["_id"] = files[0]["id"]
+            data = json.loads(download_file_to_bytes(drive_service, files[0]["id"]).decode("utf-8"))
+            if data.get("date") == day:          # วันเดียวกัน -> ใช้ค่าเดิม (คนละวัน = รีเซ็ต)
+                base["flash"] = int(data.get("flash", 0))
+                base["flash_lite"] = int(data.get("flash_lite", 0))
+            if data.get("vision_month") == month:  # เดือนเดียวกัน -> ใช้ค่าเดิม (คนละเดือน = รีเซ็ต)
+                base["vision_count"] = int(data.get("vision_count", 0))
     except Exception as e:
-        print(f"⚠️ ส่ง Telegram ไม่สำเร็จ: {e}")
+        print(f"⚠️ อ่าน {GOOGLE_USAGE_FILE} ไม่ได้ (ถือว่าโควตาเต็มศูนย์): {e}")
+    return base
+
+
+def write_google_usage(drive_service, usage):
+    payload = json.dumps({
+        "date": usage["date"], "flash": usage["flash"], "flash_lite": usage["flash_lite"],
+        "vision_month": usage["vision_month"], "vision_count": usage["vision_count"],
+    }, ensure_ascii=False)
+    media = MediaIoBaseUpload(io.BytesIO(payload.encode("utf-8")), mimetype="application/json")
+    try:
+        if usage.get("_id"):
+            drive_service.files().update(fileId=usage["_id"], media_body=media).execute()
+        else:
+            meta = {"name": GOOGLE_USAGE_FILE, "parents": [STATE_FOLDER_ID]}
+            created = drive_service.files().create(
+                body=meta, media_body=media, fields="id").execute()
+            usage["_id"] = created["id"]
+    except Exception as e:
+        print(f"⚠️ เขียน {GOOGLE_USAGE_FILE} ไม่ได้: {e}")
+
+
+# ==============================================================================
+# TELEGRAM (รองรับหลายแชท — env TELEGRAM_CHAT_ID + ไฟล์ _telegram_chats.txt บน Drive)
+# ==============================================================================
+_CHAT_IDS = []   # cache ต่อรอบ (เซ็ตที่ต้น process_cycle)
+
+
+def _split_ids(text):
+    return [c for c in (text or "").replace(",", " ").split() if c]
+
+
+def load_chat_ids(drive_service):
+    """รวม chat id จาก env (seed) + ไฟล์ _telegram_chats.txt ที่ code.gs เขียนไว้ (ไม่ซ้ำ)"""
+    ids = list(dict.fromkeys(_split_ids(TELEGRAM_CHAT_ID)))
+    try:
+        q = f"name = '{CHATS_FILE}' and '{STATE_FOLDER_ID}' in parents and trashed = false"
+        files = drive_service.files().list(
+            q=q, fields="files(id)", orderBy="modifiedTime desc").execute().get("files", [])
+        if files:
+            content = download_file_to_bytes(drive_service, files[0]["id"]).decode("utf-8")
+            for c in _split_ids(content):
+                if c not in ids:
+                    ids.append(c)
+    except Exception as e:
+        print(f"⚠️ อ่าน {CHATS_FILE} ไม่ได้: {e}")
+    return ids
+
+
+def notify_telegram(text):
+    """ส่งข้อความไปทุกแชทที่ลงทะเบียนไว้ (broadcast)"""
+    if not TELEGRAM_TOKEN:
+        return
+    chat_ids = _CHAT_IDS if _CHAT_IDS else _split_ids(TELEGRAM_CHAT_ID)
+    for cid in chat_ids:
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                data={"chat_id": cid, "text": text, "disable_web_page_preview": "true"},
+                timeout=15)
+        except Exception as e:
+            print(f"⚠️ ส่ง Telegram ({cid}) ไม่สำเร็จ: {e}")
 
 
 # ==============================================================================
@@ -356,6 +468,110 @@ def analyze_receipt(image_bytes, mime_type):
 
 
 # ==============================================================================
+# GOOGLE VISION + GEMINI ENGINE (โควตาฟรี — ใช้ก่อน Typhoon)
+# อ้างอิงไปป์ไลน์ที่พิสูจน์แล้วใน "Google Vision code/scanner.py":
+#   Vision OCR (รูป: document_text_detection / PDF: batch inline ≤5 หน้า) -> Gemini จัดเป็น JSON
+# ==============================================================================
+class NoEngineAvailable(Exception):
+    """โควตา Google หมด และไม่ได้ตั้ง Typhoon ไว้ — ไม่มีเครื่องยนต์ให้ใช้"""
+
+
+def _is_quota_error(e):
+    s = str(e)
+    return "429" in s or "RESOURCE_EXHAUSTED" in s
+
+
+def ocr_with_vision(vision_client, file_bytes, mime_type):
+    """Google Cloud Vision OCR -> ข้อความดิบ (รูปใช้ document_text_detection, PDF ใช้ batch inline ≤5 หน้า)"""
+    if "pdf" in mime_type:
+        input_config = vision.InputConfig(content=file_bytes, mime_type="application/pdf")
+        features = [vision.Feature(type_=vision.Feature.Type.DOCUMENT_TEXT_DETECTION)]
+        req = vision.AnnotateFileRequest(
+            input_config=input_config, features=features, pages=[1, 2, 3, 4, 5])
+        response = vision_client.batch_annotate_files(requests=[req])
+        pages = response.responses[0].responses
+        return "\n".join(p.full_text_annotation.text for p in pages if p.full_text_annotation.text)
+    image = vision.Image(content=file_bytes)
+    response = vision_client.document_text_detection(image=image)
+    if response.error.message:
+        raise Exception(f"Vision API error: {response.error.message}")
+    return response.full_text_annotation.text
+
+
+def analyze_text_with_gemini(full_text, model_name):
+    """ส่งข้อความ OCR ให้ Gemini จัดเป็น JSON ตามสคีมา BillVerification (structured output)"""
+    response = client_gemini.models.generate_content(
+        model=model_name,
+        contents=[TYPHOON_PROMPT + full_text],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=BillVerification,
+            temperature=0.0,
+        ),
+    )
+    return BillVerification(**json.loads(response.text)).model_dump()
+
+
+class NoGoogleQuota(Exception):
+    """โควตา Google หมด (Vision รายเดือน หรือ Gemini รายวันเต็มทุกโมเดล) — ให้ใช้ Typhoon"""
+
+
+def _google_attempt(vision_client, image_bytes, mime_type, drive_service, usage):
+    """Vision OCR ครั้งเดียว (นับโควตาเดือน) แล้วลอง Gemini ทีละโมเดล -> (bill, engine_label)
+    raise NoGoogleQuota ถ้าโควตาหมด ; raise อื่น ๆ ถ้า Google error (ให้ตกไป Typhoon)"""
+    if usage.get("vision_count", 0) >= VISION_MONTHLY_LIMIT:
+        raise NoGoogleQuota(f"Vision ครบ {VISION_MONTHLY_LIMIT} หน้า/เดือนแล้ว")
+    if usage.get("flash", 0) >= GEMINI_DAILY_LIMIT and usage.get("flash_lite", 0) >= GEMINI_DAILY_LIMIT:
+        raise NoGoogleQuota("Gemini ครบโควตาวันแล้วทุกโมเดล")
+
+    # --- Vision OCR (นับ 1 หน้าต่อ 1 เอกสาร — นับทันทีหลังเรียกสำเร็จ ก่อนลอง Gemini) ---
+    ocr_text = ocr_with_vision(vision_client, image_bytes, mime_type)
+    usage["vision_count"] = usage.get("vision_count", 0) + 1
+    write_google_usage(drive_service, usage)
+    if not ocr_text or not ocr_text.strip():
+        raise Exception("Vision OCR ไม่พบข้อความในเอกสาร")
+
+    # --- Gemini วิเคราะห์ข้อความ (ลอง flash ก่อน หมดแล้วต่อ flash-lite) ---
+    last_err = None
+    for key in ("flash", "flash_lite"):
+        if usage.get(key, 0) >= GEMINI_DAILY_LIMIT:
+            continue
+        model_name = GEMINI_MODELS[key]
+        try:
+            bill = analyze_text_with_gemini(ocr_text, model_name)
+            usage[key] = usage.get(key, 0) + 1
+            write_google_usage(drive_service, usage)
+            return bill, f"Google/{model_name}"
+        except Exception as e:
+            if _is_quota_error(e):
+                print(f"  🔻 {model_name} โควตาหมด (429) -> ปิดโมเดลนี้ของวันนี้")
+                usage[key] = GEMINI_DAILY_LIMIT          # มาร์คว่าเต็ม กันยิงซ้ำ
+                write_google_usage(drive_service, usage)
+                last_err = e
+                continue                                 # ลองโมเดลถัดไป
+            raise                                        # Gemini error อื่น -> ตกไป Typhoon
+    raise NoGoogleQuota(str(last_err) if last_err else "Gemini ใช้ไม่ได้")
+
+
+def analyze_with_best_engine(vision_client, image_bytes, mime_type, drive_service, usage, doc_counter):
+    """ลองฝั่ง Google (Vision+Gemini) จนเต็มโควตา แล้วค่อย fallback ไป Typhoon
+    คืน (bill_dict, engine_label). อัปเดต/บันทึกตัวนับโควตาให้เอง"""
+    if GOOGLE_ENABLED and vision_client is not None and usage is not None:
+        try:
+            return _google_attempt(vision_client, image_bytes, mime_type, drive_service, usage)
+        except NoGoogleQuota:
+            pass   # โควตา Google หมด -> ใช้ Typhoon เงียบ ๆ
+        except Exception as e:
+            print(f"  ⚠️ Google ล้มเหลว: {e} -> ลอง Typhoon")
+
+    # --- Typhoon (ไม่จำกัดจำนวน) ---
+    if not TYPHOON_API_KEYS:
+        raise NoEngineAvailable("โควตา Google หมด และไม่ได้ตั้ง TYPHOON_API_KEYS")
+    select_typhoon_key(doc_counter)
+    return analyze_receipt(image_bytes, mime_type), f"Typhoon[คีย์{current_key_index + 1}]"
+
+
+# ==============================================================================
 # PROCESSING CYCLE
 # ==============================================================================
 def reset_processing_to_inbox(drive_service):
@@ -380,12 +596,14 @@ def _compress_image(raw_bytes):
         return raw_bytes
 
 
-def process_cycle(drive_service, sheet_service, manual=False):
+def process_cycle(drive_service, sheet_service, vision_service, manual=False):
     """ประมวลผลไฟล์ทั้งหมดใน Inbox 1 รอบ คืนค่า (success, error, timeout, total)
 
     manual=True (สั่งจากคำสั่ง run/scan) → แจ้งกลับ Telegram แม้ Inbox ว่าง
     เพื่อให้รู้ว่าคำสั่งทำงานแล้วจริง (auto/scheduler จะเงียบไว้ ไม่สแปม)
     """
+    global _CHAT_IDS
+    _CHAT_IDS = load_chat_ids(drive_service)   # โหลดรายชื่อแชทไว้ broadcast ทุกข้อความ
     reset_processing_to_inbox(drive_service)
 
     files = list_files_in_folder(drive_service, FOLDER_INBOX)
@@ -394,6 +612,14 @@ def process_cycle(drive_service, sheet_service, manual=False):
         if manual:
             notify_telegram("ℹ️ (Cloud Run) ไม่มีไฟล์ใน Inbox ให้ประมวลผล")
         return 0, 0, 0, 0
+
+    # โหลดตัวนับโควตา Google ของวันนี้ (None = ปิดเครื่องยนต์ Google -> ใช้ Typhoon ล้วน)
+    google_ready = GOOGLE_ENABLED and vision_service is not None
+    google_usage = read_google_usage(drive_service) if google_ready else None
+    if google_usage is not None:
+        print(f"🔢 โควตา Gemini วันนี้: flash {google_usage['flash']}/{GEMINI_DAILY_LIMIT}, "
+              f"flash_lite {google_usage['flash_lite']}/{GEMINI_DAILY_LIMIT} | "
+              f"Vision เดือนนี้ {google_usage['vision_count']}/{VISION_MONTHLY_LIMIT} หน้า")
 
     start_time = datetime.now()
     total = len(bills)
@@ -406,15 +632,16 @@ def process_cycle(drive_service, sheet_service, manual=False):
         file_id, file_name, mime_type = f["id"], f["name"], f["mimeType"]
         file_start = datetime.now()   # จับเวลาเริ่มของไฟล์นี้ (ใช้แจ้งเวลาต่อไฟล์)
         doc_counter += 1
-        select_typhoon_key(doc_counter)
-        print(f"⚡ [{idx}/{total}] {file_name} [คีย์ {current_key_index + 1}/{len(TYPHOON_API_KEYS)}]")
+        print(f"⚡ [{idx}/{total}] {file_name}")
 
         try:
             move_file(drive_service, file_id, FOLDER_PROCESSING)
             raw = download_file_to_bytes(drive_service, file_id)
             image_bytes = _compress_image(raw) if "image" in mime_type else raw
 
-            bill = analyze_receipt(image_bytes, mime_type)
+            bill, engine = analyze_with_best_engine(
+                vision_service, image_bytes, mime_type, drive_service, google_usage, doc_counter)
+            print(f"  🤖 ใช้เครื่องยนต์: {engine}")
             if not bill.get("is_valid_bill"):
                 print("  ⚠️ ไม่ใช่บิล -> Error")
                 move_file(drive_service, file_id, FOLDER_ERROR)
@@ -434,8 +661,16 @@ def process_cycle(drive_service, sheet_service, manual=False):
             move_file(drive_service, file_id, target)
             print(f"  ✅ สำเร็จ -> Success/{recorded_month}/")
             file_elapsed = int((datetime.now() - file_start).total_seconds())
-            notify_telegram(f"✅ (Cloud Run)สแกนบิลสำเร็จ[{idx}/{total}] {file_name} ใช้เวลา {file_elapsed} วินาที")
+            notify_telegram(f"✅ (Cloud Run)สแกนบิลสำเร็จ[{idx}/{total}] {file_name} "
+                            f"ใช้เวลา {file_elapsed} วินาที [{engine}]")
             success += 1
+
+        except NoEngineAvailable as e:
+            move_file(drive_service, file_id, FOLDER_INBOX)
+            print(f"  🛑 {e} -> กลับ Inbox, หยุดรอบนี้ (รอโควตารีเซ็ต)")
+            notify_telegram("🛑 (Cloud Run) โควตา Google หมด และไม่ได้ตั้ง Typhoon — "
+                            "หยุดรอบนี้ รอโควตารีเซ็ตตอน 07:00")
+            break
 
         except Exception as e:
             err = str(e)
@@ -476,16 +711,23 @@ def process_cycle(drive_service, sheet_service, manual=False):
 # cache services ระดับ instance (warm start ไม่ต้อง build ใหม่ทุก request)
 _DRIVE = None
 _SHEET = None
+_VISION = None
 
 
 def _services():
-    global _DRIVE, _SHEET
+    global _DRIVE, _SHEET, _VISION
     if _DRIVE is None:
         creds = get_credentials()
         _DRIVE = get_drive_service(creds)
         _SHEET = get_sheet_service(creds)
+        if GOOGLE_ENABLED:   # สร้าง Vision client จาก SA เดียวกัน (ADC) เมื่อเปิดเครื่องยนต์ Google
+            try:
+                _VISION = vision.ImageAnnotatorClient(credentials=creds)
+            except Exception as e:
+                print(f"⚠️ สร้าง Vision client ไม่ได้ (จะใช้ Typhoon ล้วน): {e}")
+                _VISION = None
         check_and_create_headers(_SHEET, SPREADSHEET_ID, SHEET_TAB_NAME)
-    return _DRIVE, _SHEET
+    return _DRIVE, _SHEET, _VISION
 
 
 @functions_framework.http
@@ -497,11 +739,11 @@ def scan(request):
         if token != TRIGGER_TOKEN:
             return ({"error": "forbidden"}, 403)
 
-    if not TYPHOON_API_KEYS:
-        return ({"error": "TYPHOON_API_KEYS not set"}, 500)
+    if not TYPHOON_API_KEYS and not GOOGLE_ENABLED:
+        return ({"error": "ไม่ได้ตั้งเครื่องยนต์ OCR เลย — ต้องมี GEMINI_API_KEY หรือ TYPHOON_API_KEYS"}, 500)
 
     try:
-        drive_service, sheet_service = _services()
+        drive_service, sheet_service, vision_service = _services()
     except Exception as e:
         print(f"❌ init error: {e}")
         return ({"error": f"init failed: {e}"}, 500)
@@ -514,7 +756,7 @@ def scan(request):
     if state != "on" and not force:
         return ({"status": "skipped", "reason": "autorun off"}, 200)
 
-    success, error, timeout, total = process_cycle(drive_service, sheet_service, manual=force)
+    success, error, timeout, total = process_cycle(drive_service, sheet_service, vision_service, manual=force)
     return ({
         "status": "ok",
         "processed": total,

@@ -1,0 +1,36 @@
+# =============================================================================
+# .gcloudignore — ไฟล์ที่ "ไม่ต้องอัปโหลด" ตอน `gcloud run deploy --source .`
+# (ถ้ามีไฟล์นี้ gcloud จะใช้ตัวนี้แทน .gitignore ในการกรองไฟล์ที่ส่งขึ้น Cloud Build)
+#
+# ตอบคำถาม: ใช่ — `--source .` จะ zip โฟลเดอร์นี้ส่งขึ้น Cloud Build เพื่อ build เป็น container
+# แต่ container ต้องการแค่ main.py + requirements.txt ก็พอ ที่เหลือ (สคริปต์ deploy, .gs,
+# เอกสาร, ความลับ) ไม่ต้องขึ้นไป จึงตัดทิ้งด้วยไฟล์นี้ -> build เร็วขึ้นและไม่ติดความลับไปกับ image
+# หมายเหตุ: ค่าใน env.yaml ยังเข้า container ได้ตามปกติผ่าน --env-vars-file (คนละกลไกกับการอัปโหลด source)
+# =============================================================================
+
+# version control / เอกสาร / สคริปต์ฝั่ง local
+.git/
+.gitignore
+.gcloudignore
+README.md
+*.ps1
+
+# Apps Script (ไม่เกี่ยวกับ container ฝั่ง Cloud Run)
+*.gs
+*.template
+
+# โฟลเดอร์อ้างอิง (local reference เท่านั้น — มี SA key อยู่ข้างใน ห้ามขึ้น build)
+Google Vision code/
+
+# ความลับ / ค่าคอนฟิก (ค่าเข้า container ผ่าน --env-vars-file อยู่แล้ว)
+env.yaml
+env.example.yaml
+.env
+.env.*
+
+# สถานะ/ของชั่วคราว
+_autorun_state.txt
+__pycache__/
+*.py[cod]
+.venv/
+venv/
