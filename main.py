@@ -104,6 +104,7 @@ CHATS_FILE = "_telegram_chats.txt"         # รายชื่อ chat id (code
 # ตัวนับโควตา Gemini/Vision เก็บในแท็บของ Google Sheet (ไม่ใช่ไฟล์ Drive) เพราะ Service Account
 # สร้างไฟล์ใหม่ใน My Drive ไม่ได้ (storageQuotaExceeded) แต่แก้ชีตที่มีอยู่แล้วได้ปกติ
 QUOTA_SHEET_TAB = os.getenv("QUOTA_SHEET_TAB", "_QuotaState")  # แท็บเก็บตัวนับ (เซลล์ A1 = JSON)
+ERROR_SHEET_TAB = os.getenv("ERROR_SHEET_TAB", "Error")        # แท็บบันทึกเอกสารที่ Error (กรอกเองต่อได้)
 DEFAULT_AUTORUN = os.getenv("DEFAULT_AUTORUN", "on")  # ถ้ายังไม่มีไฟล์สถานะ ให้ถือว่าเปิด
 
 SCOPES = [
@@ -118,6 +119,12 @@ HEADERS = [
     "รายการ", "มูลค่าสินค้า", "จำนวนภาษี (VAT)", "จำนวนเงินรวม",
     "ความน่าเชื่อถือ(%)", "หมายเหตุ", "ลิงก์รูปภาพใน Drive",
     "เวลาที่บันทึก", "โมเดลที่ประมวลผล", "เวลาที่ใช้ประมวลผล (วินาที)",
+]
+
+# หัวข้อแท็บ Error — เอกสารที่สแกนไม่ผ่าน (อ่านไม่ออก/ไม่ใช่บิล/ระบบล้มเหลว) เก็บไว้ให้คนกรอกเองต่อได้
+ERROR_HEADERS = [
+    "ชื่อไฟล์", "ประเภทบิล", "รายละเอียดของError", "ลิงก์รูปภาพใน Drive",
+    "TimeStamp", "Model", "เวลาที่ใช้ประมวลผล (วินาที)",
 ]
 
 # GLOBAL: คีย์ปัจจุบัน + client (วนใหม่ต่อเอกสาร)
@@ -167,6 +174,8 @@ _BASE_PROMPT = """
 
 [ขั้นที่ 1: คัดกรอง]
 - เป็นเอกสารบัญชีหรือไม่ (ใบเสร็จ, ใบกำกับภาษี, บิลเงินสด, ใบส่งสินค้า)?
+- บิลเงินสด/ใบเสร็จเงินสด ถือเป็นบิลเสมอ (is_valid_bill = true) อย่าปฏิเสธเพราะไม่มีเลขผู้เสียภาษีหรือ VAT
+- เอกสารที่ปนภาษาไทย/อังกฤษ/จีน ถือเป็นเรื่องปกติ ไม่ใช่เหตุให้ปฏิเสธหรือลด confidence
 - ถ้าไม่ใช่ หรือเป็นข้อความขยะ/อ่านไม่ออก -> is_valid_bill = false และทุกฟิลด์ที่เหลือเป็น null ทันที
 - ถ้าใช่ -> is_valid_bill = true แล้วทำขั้นที่ 2
 
@@ -263,14 +272,14 @@ def get_or_create_monthly_folder(service, parent_folder_id, folder_name):
     return service.files().create(body=meta, fields="id").execute().get("id")
 
 
-def check_and_create_headers(sheet_service, spreadsheet_id, tab_name):
+def check_and_create_headers(sheet_service, spreadsheet_id, tab_name, headers=HEADERS):
     res = sheet_service.spreadsheets().values().get(
         spreadsheetId=spreadsheet_id, range=f"{tab_name}!A1:A1").execute()
     values = res.get("values", [])
     if not values or not values[0] or values[0][0] == "":
         sheet_service.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id, range=f"{tab_name}!A1",
-            valueInputOption="USER_ENTERED", body={"values": [HEADERS]}).execute()
+            valueInputOption="USER_ENTERED", body={"values": [headers]}).execute()
 
 
 def append_to_sheet(sheet_service, spreadsheet_id, tab_name, data_list):
@@ -340,19 +349,38 @@ def _quota_day():
     return shifted.strftime("%Y-%m-%d")
 
 
-def ensure_quota_tab(sheet_service):
-    """สร้างแท็บ QUOTA_SHEET_TAB ถ้ายังไม่มี (แค่เพิ่มแท็บในสเปรดชีตเดิม ไม่สร้างไฟล์ใหม่ -> SA ทำได้)"""
+def ensure_sheet_tab(sheet_service, tab_name):
+    """สร้างแท็บ tab_name ถ้ายังไม่มี (แค่เพิ่มแท็บในสเปรดชีตเดิม ไม่สร้างไฟล์ใหม่ -> SA ทำได้)"""
     try:
         meta = sheet_service.spreadsheets().get(
             spreadsheetId=SPREADSHEET_ID, fields="sheets.properties.title").execute()
         titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
-        if QUOTA_SHEET_TAB not in titles:
+        if tab_name not in titles:
             sheet_service.spreadsheets().batchUpdate(
                 spreadsheetId=SPREADSHEET_ID,
-                body={"requests": [{"addSheet": {"properties": {"title": QUOTA_SHEET_TAB}}}]}).execute()
-            print(f"🆕 สร้างแท็บตัวนับโควตา: {QUOTA_SHEET_TAB}")
+                body={"requests": [{"addSheet": {"properties": {"title": tab_name}}}]}).execute()
+            print(f"🆕 สร้างแท็บ: {tab_name}")
     except Exception as e:
-        print(f"⚠️ ตรวจ/สร้างแท็บ {QUOTA_SHEET_TAB} ไม่ได้: {e}")
+        print(f"⚠️ ตรวจ/สร้างแท็บ {tab_name} ไม่ได้: {e}")
+
+
+def ensure_quota_tab(sheet_service):
+    """สร้างแท็บ QUOTA_SHEET_TAB ถ้ายังไม่มี (เก็บตัวนับโควตาในเซลล์ A1)"""
+    ensure_sheet_tab(sheet_service, QUOTA_SHEET_TAB)
+
+
+def log_error_to_sheet(sheet_service, file_name, bill_type, error_detail, drive_link, model, elapsed):
+    """บันทึก 1 แถวลงแท็บ Error (สร้าง/เติมหัวข้อให้อัตโนมัติ) — เผื่อคนมากรอกรายละเอียดเองต่อ
+    ห้ามให้ความล้มเหลวของการ log มาทำให้รอบประมวลผลพัง จึง try/except ครอบทั้งหมด"""
+    try:
+        ensure_sheet_tab(sheet_service, ERROR_SHEET_TAB)
+        check_and_create_headers(sheet_service, SPREADSHEET_ID, ERROR_SHEET_TAB, ERROR_HEADERS)
+        timestamp = (datetime.now() + timedelta(hours=QUOTA_TZ_OFFSET)).strftime("%Y-%m-%d %H:%M:%S")
+        row = [file_name, bill_type or "", error_detail or "", drive_link,
+               timestamp, model or "", elapsed]
+        append_to_sheet(sheet_service, SPREADSHEET_ID, ERROR_SHEET_TAB, row)
+    except Exception as e:
+        print(f"⚠️ บันทึกแท็บ {ERROR_SHEET_TAB} ไม่ได้: {e}")
 
 
 def read_google_usage(sheet_service):
@@ -678,6 +706,10 @@ def process_cycle(drive_service, sheet_service, vision_service, manual=False):
                 print("  ⚠️ ไม่ใช่บิล -> Error")
                 move_file(drive_service, file_id, FOLDER_ERROR)
                 note = bill.get("note") or "อ่านไม่ออก/ไม่ใช่เอกสารบัญชี"
+                drive_link = f"https://drive.google.com/file/d/{file_id}/view"
+                file_elapsed = int((datetime.now() - file_start).total_seconds())
+                log_error_to_sheet(sheet_service, file_name, bill.get("bill_type"),
+                                   note, drive_link, engine, file_elapsed)
                 notify_telegram(f"⚠️ (Cloud Run) ไม่ใช่บิล[{idx}/{total}] {file_name} "
                                 f"-> ย้ายเข้า Error ({note}) [{engine}]")
                 error += 1
@@ -731,6 +763,9 @@ def process_cycle(drive_service, sheet_service, vision_service, manual=False):
                 continue
 
             move_file(drive_service, file_id, FOLDER_ERROR)
+            drive_link = f"https://drive.google.com/file/d/{file_id}/view"
+            file_elapsed = int((datetime.now() - file_start).total_seconds())
+            log_error_to_sheet(sheet_service, file_name, None, err, drive_link, None, file_elapsed)
             notify_telegram(f"❌ (Cloud Run) สแกนล้มเหลว[{idx}/{total}] {file_name} "
                             f"-> ย้ายเข้า Error\nสาเหตุ: {err}")
             error += 1
@@ -767,6 +802,8 @@ def _services():
                 _VISION = None
             ensure_quota_tab(_SHEET)   # แท็บเก็บตัวนับโควตา (SA สร้างแท็บในชีตเดิมได้ ไม่ติด storage quota)
         check_and_create_headers(_SHEET, SPREADSHEET_ID, SHEET_TAB_NAME)
+        ensure_sheet_tab(_SHEET, ERROR_SHEET_TAB)   # แท็บ Error (สร้างล่วงหน้า + เติมหัวข้อ)
+        check_and_create_headers(_SHEET, SPREADSHEET_ID, ERROR_SHEET_TAB, ERROR_HEADERS)
     return _DRIVE, _SHEET, _VISION
 
 
