@@ -1,0 +1,14 @@
+# Secrets & credentials
+.env
+config/*.json
+
+# Local uploads
+uploads/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/

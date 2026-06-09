@@ -22,6 +22,7 @@ deploy ด้วย `gcloud run deploy --source .` แล้ว buildpacks ส�
 import io
 import os
 import json
+import time
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -33,7 +34,7 @@ from openai import OpenAI
 
 import google.auth
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+from googleapiclient.http import MediaIoBaseDownload
 
 # Google Vision + Gemini SDK (ออปชัน — ถ้าไม่ได้ติดตั้ง/ไม่ตั้งคีย์ จะใช้ Typhoon ล้วน)
 try:
@@ -66,6 +67,9 @@ GEMINI_MODELS = {
 }
 # โควตาฟรีต่อโมเดลต่อวัน (2 โมเดล = 40 ไฟล์/วัน) แล้วรีเซ็ตตอน RESET_HOUR ทุกวัน
 GEMINI_DAILY_LIMIT = int(os.getenv("GEMINI_DAILY_LIMIT_PER_MODEL", "20"))
+# 503/โหลดหนักเป็น error ชั่วคราว — retry โมเดลละกี่ครั้งก่อนข้ามไปโมเดลถัดไป/Typhoon (+backoff วินาที)
+GEMINI_MAX_ATTEMPTS = int(os.getenv("GEMINI_MAX_ATTEMPTS", "2"))
+GEMINI_RETRY_BACKOFF = int(os.getenv("GEMINI_RETRY_BACKOFF", "2"))
 QUOTA_RESET_HOUR = int(os.getenv("GOOGLE_QUOTA_RESET_HOUR", "7"))   # 07:00 น.
 QUOTA_TZ_OFFSET = int(os.getenv("GOOGLE_QUOTA_TZ_OFFSET", "7"))     # เขตเวลา (ไทย = UTC+7)
 # เพดาน Vision OCR ต่อเดือน — กันทะลุโควตาฟรี (Vision ฟรี 1000 หน้า/เดือน) ครบแล้วสลับไป Typhoon
@@ -96,8 +100,10 @@ FOLDER_ERROR = os.getenv("FOLDER_ERROR", "")
 # โฟลเดอร์เก็บไฟล์สถานะ autorun (ต้องตรงกับ code.gs) — ใช้ Success เพราะ worker ไม่สแกน
 STATE_FOLDER_ID = FOLDER_SUCCESS
 AUTORUN_FILE = "_autorun_state.txt"
-GOOGLE_USAGE_FILE = "_google_usage.json"   # ตัวนับโควตา Gemini ต่อวัน (รีเซ็ตตอน 07:00)
 CHATS_FILE = "_telegram_chats.txt"         # รายชื่อ chat id (code.gs เขียน, worker อ่านไป broadcast)
+# ตัวนับโควตา Gemini/Vision เก็บในแท็บของ Google Sheet (ไม่ใช่ไฟล์ Drive) เพราะ Service Account
+# สร้างไฟล์ใหม่ใน My Drive ไม่ได้ (storageQuotaExceeded) แต่แก้ชีตที่มีอยู่แล้วได้ปกติ
+QUOTA_SHEET_TAB = os.getenv("QUOTA_SHEET_TAB", "_QuotaState")  # แท็บเก็บตัวนับ (เซลล์ A1 = JSON)
 DEFAULT_AUTORUN = os.getenv("DEFAULT_AUTORUN", "on")  # ถ้ายังไม่มีไฟล์สถานะ ให้ถือว่าเปิด
 
 SCOPES = [
@@ -111,6 +117,7 @@ HEADERS = [
     "ชื่อผู้ขาย (รวมสาขา)", "ที่อยู่ผู้ขาย", "ชื่อผู้ซื้อ", "ที่อยู่ผู้ซื้อ",
     "รายการ", "มูลค่าสินค้า", "จำนวนภาษี (VAT)", "จำนวนเงินรวม",
     "ความน่าเชื่อถือ(%)", "หมายเหตุ", "ลิงก์รูปภาพใน Drive",
+    "เวลาที่บันทึก", "โมเดลที่ประมวลผล", "เวลาที่ใช้ประมวลผล (วินาที)",
 ]
 
 # GLOBAL: คีย์ปัจจุบัน + client (วนใหม่ต่อเอกสาร)
@@ -333,46 +340,54 @@ def _quota_day():
     return shifted.strftime("%Y-%m-%d")
 
 
-def read_google_usage(drive_service):
-    """อ่านตัวนับ Gemini รายวัน {flash, flash_lite} + Vision รายเดือน {vision_count}
-    คนละวัน -> รีเซ็ต Gemini ; คนละเดือน -> รีเซ็ต Vision. เก็บ _id ไว้เขียนทับ"""
+def ensure_quota_tab(sheet_service):
+    """สร้างแท็บ QUOTA_SHEET_TAB ถ้ายังไม่มี (แค่เพิ่มแท็บในสเปรดชีตเดิม ไม่สร้างไฟล์ใหม่ -> SA ทำได้)"""
+    try:
+        meta = sheet_service.spreadsheets().get(
+            spreadsheetId=SPREADSHEET_ID, fields="sheets.properties.title").execute()
+        titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
+        if QUOTA_SHEET_TAB not in titles:
+            sheet_service.spreadsheets().batchUpdate(
+                spreadsheetId=SPREADSHEET_ID,
+                body={"requests": [{"addSheet": {"properties": {"title": QUOTA_SHEET_TAB}}}]}).execute()
+            print(f"🆕 สร้างแท็บตัวนับโควตา: {QUOTA_SHEET_TAB}")
+    except Exception as e:
+        print(f"⚠️ ตรวจ/สร้างแท็บ {QUOTA_SHEET_TAB} ไม่ได้: {e}")
+
+
+def read_google_usage(sheet_service):
+    """อ่านตัวนับ Gemini รายวัน {flash, flash_lite} + Vision รายเดือน {vision_count} จากเซลล์ A1 ของแท็บ
+    คนละวัน -> รีเซ็ต Gemini ; คนละเดือน -> รีเซ็ต Vision"""
     day = _quota_day()
     month = datetime.utcnow().strftime("%Y-%m")   # Vision คิดตามเดือนปฏิทิน (billing)
-    base = {"date": day, "flash": 0, "flash_lite": 0,
-            "vision_month": month, "vision_count": 0, "_id": None}
+    base = {"date": day, "flash": 0, "flash_lite": 0, "vision_month": month, "vision_count": 0}
     try:
-        q = f"name = '{GOOGLE_USAGE_FILE}' and '{STATE_FOLDER_ID}' in parents and trashed = false"
-        files = drive_service.files().list(
-            q=q, fields="files(id)", orderBy="modifiedTime desc").execute().get("files", [])
-        if files:
-            base["_id"] = files[0]["id"]
-            data = json.loads(download_file_to_bytes(drive_service, files[0]["id"]).decode("utf-8"))
+        res = sheet_service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID, range=f"{QUOTA_SHEET_TAB}!A1").execute()
+        values = res.get("values", [])
+        if values and values[0] and values[0][0]:
+            data = json.loads(values[0][0])
             if data.get("date") == day:          # วันเดียวกัน -> ใช้ค่าเดิม (คนละวัน = รีเซ็ต)
                 base["flash"] = int(data.get("flash", 0))
                 base["flash_lite"] = int(data.get("flash_lite", 0))
             if data.get("vision_month") == month:  # เดือนเดียวกัน -> ใช้ค่าเดิม (คนละเดือน = รีเซ็ต)
                 base["vision_count"] = int(data.get("vision_count", 0))
     except Exception as e:
-        print(f"⚠️ อ่าน {GOOGLE_USAGE_FILE} ไม่ได้ (ถือว่าโควตาเต็มศูนย์): {e}")
+        print(f"⚠️ อ่านตัวนับโควตา ({QUOTA_SHEET_TAB}) ไม่ได้ (ถือว่าเริ่มศูนย์): {e}")
     return base
 
 
-def write_google_usage(drive_service, usage):
+def write_google_usage(sheet_service, usage):
     payload = json.dumps({
         "date": usage["date"], "flash": usage["flash"], "flash_lite": usage["flash_lite"],
         "vision_month": usage["vision_month"], "vision_count": usage["vision_count"],
     }, ensure_ascii=False)
-    media = MediaIoBaseUpload(io.BytesIO(payload.encode("utf-8")), mimetype="application/json")
     try:
-        if usage.get("_id"):
-            drive_service.files().update(fileId=usage["_id"], media_body=media).execute()
-        else:
-            meta = {"name": GOOGLE_USAGE_FILE, "parents": [STATE_FOLDER_ID]}
-            created = drive_service.files().create(
-                body=meta, media_body=media, fields="id").execute()
-            usage["_id"] = created["id"]
+        sheet_service.spreadsheets().values().update(
+            spreadsheetId=SPREADSHEET_ID, range=f"{QUOTA_SHEET_TAB}!A1",
+            valueInputOption="RAW", body={"values": [[payload]]}).execute()
     except Exception as e:
-        print(f"⚠️ เขียน {GOOGLE_USAGE_FILE} ไม่ได้: {e}")
+        print(f"⚠️ เขียนตัวนับโควตา ({QUOTA_SHEET_TAB}) ไม่ได้: {e}")
 
 
 # ==============================================================================
@@ -481,6 +496,13 @@ def _is_quota_error(e):
     return "429" in s or "RESOURCE_EXHAUSTED" in s
 
 
+def _is_transient_error(e):
+    """error ชั่วคราวฝั่ง Gemini (โมเดลโหลดหนัก/เซิร์ฟเวอร์ล่ม) — ควร retry/ลองโมเดลถัดไป ไม่ใช่โควตาหมด"""
+    s = str(e).lower()
+    return ("503" in s or "unavailable" in s or "500" in s or "internal" in s
+            or "overloaded" in s or "high demand" in s or "deadline" in s)
+
+
 def ocr_with_vision(vision_client, file_bytes, mime_type):
     """Google Cloud Vision OCR -> ข้อความดิบ (รูปใช้ document_text_detection, PDF ใช้ batch inline ≤5 หน้า)"""
     if "pdf" in mime_type:
@@ -516,7 +538,7 @@ class NoGoogleQuota(Exception):
     """โควตา Google หมด (Vision รายเดือน หรือ Gemini รายวันเต็มทุกโมเดล) — ให้ใช้ Typhoon"""
 
 
-def _google_attempt(vision_client, image_bytes, mime_type, drive_service, usage):
+def _google_attempt(vision_client, image_bytes, mime_type, sheet_service, usage):
     """Vision OCR ครั้งเดียว (นับโควตาเดือน) แล้วลอง Gemini ทีละโมเดล -> (bill, engine_label)
     raise NoGoogleQuota ถ้าโควตาหมด ; raise อื่น ๆ ถ้า Google error (ให้ตกไป Typhoon)"""
     if usage.get("vision_count", 0) >= VISION_MONTHLY_LIMIT:
@@ -527,7 +549,7 @@ def _google_attempt(vision_client, image_bytes, mime_type, drive_service, usage)
     # --- Vision OCR (นับ 1 หน้าต่อ 1 เอกสาร — นับทันทีหลังเรียกสำเร็จ ก่อนลอง Gemini) ---
     ocr_text = ocr_with_vision(vision_client, image_bytes, mime_type)
     usage["vision_count"] = usage.get("vision_count", 0) + 1
-    write_google_usage(drive_service, usage)
+    write_google_usage(sheet_service, usage)
     if not ocr_text or not ocr_text.strip():
         raise Exception("Vision OCR ไม่พบข้อความในเอกสาร")
 
@@ -537,28 +559,38 @@ def _google_attempt(vision_client, image_bytes, mime_type, drive_service, usage)
         if usage.get(key, 0) >= GEMINI_DAILY_LIMIT:
             continue
         model_name = GEMINI_MODELS[key]
-        try:
-            bill = analyze_text_with_gemini(ocr_text, model_name)
-            usage[key] = usage.get(key, 0) + 1
-            write_google_usage(drive_service, usage)
-            return bill, f"Google/{model_name}"
-        except Exception as e:
-            if _is_quota_error(e):
-                print(f"  🔻 {model_name} โควตาหมด (429) -> ปิดโมเดลนี้ของวันนี้")
-                usage[key] = GEMINI_DAILY_LIMIT          # มาร์คว่าเต็ม กันยิงซ้ำ
-                write_google_usage(drive_service, usage)
+        for attempt in range(GEMINI_MAX_ATTEMPTS):   # ลองโมเดลละหลายครั้ง เผื่อ 503 ชั่วคราว
+            try:
+                bill = analyze_text_with_gemini(ocr_text, model_name)
+                usage[key] = usage.get(key, 0) + 1
+                write_google_usage(sheet_service, usage)
+                return bill, f"Google/{model_name}"
+            except Exception as e:
                 last_err = e
-                continue                                 # ลองโมเดลถัดไป
-            raise                                        # Gemini error อื่น -> ตกไป Typhoon
+                if _is_quota_error(e):
+                    print(f"  🔻 {model_name} โควตาหมด (429) -> ปิดโมเดลนี้ของวันนี้")
+                    usage[key] = GEMINI_DAILY_LIMIT      # มาร์คว่าเต็ม กันยิงซ้ำ
+                    write_google_usage(sheet_service, usage)
+                    break                                # โควตาหมด -> ข้ามไปโมเดลถัดไป
+                if _is_transient_error(e):
+                    if attempt + 1 < GEMINI_MAX_ATTEMPTS:
+                        wait = GEMINI_RETRY_BACKOFF * (attempt + 1)
+                        print(f"  🔁 {model_name} ชั่วคราว (503/overloaded) -> รอ {wait}s ลองใหม่")
+                        time.sleep(wait)
+                        continue                         # ลองโมเดลเดิมอีกครั้ง
+                    print(f"  🔁 {model_name} ยังล่ม -> ลองโมเดลถัดไป")
+                    break                                # ครบจำนวนครั้ง -> โมเดลถัดไป
+                raise                                    # Gemini error จริงอื่น -> ตกไป Typhoon
+    # ลอง Gemini ครบทุกโมเดลแล้วยังไม่สำเร็จ (โควตาหมด/ล่มชั่วคราว) -> ให้ Typhoon รับช่วง
     raise NoGoogleQuota(str(last_err) if last_err else "Gemini ใช้ไม่ได้")
 
 
-def analyze_with_best_engine(vision_client, image_bytes, mime_type, drive_service, usage, doc_counter):
+def analyze_with_best_engine(vision_client, image_bytes, mime_type, sheet_service, usage, doc_counter):
     """ลองฝั่ง Google (Vision+Gemini) จนเต็มโควตา แล้วค่อย fallback ไป Typhoon
     คืน (bill_dict, engine_label). อัปเดต/บันทึกตัวนับโควตาให้เอง"""
     if GOOGLE_ENABLED and vision_client is not None and usage is not None:
         try:
-            return _google_attempt(vision_client, image_bytes, mime_type, drive_service, usage)
+            return _google_attempt(vision_client, image_bytes, mime_type, sheet_service, usage)
         except NoGoogleQuota:
             pass   # โควตา Google หมด -> ใช้ Typhoon เงียบ ๆ
         except Exception as e:
@@ -615,7 +647,7 @@ def process_cycle(drive_service, sheet_service, vision_service, manual=False):
 
     # โหลดตัวนับโควตา Google ของวันนี้ (None = ปิดเครื่องยนต์ Google -> ใช้ Typhoon ล้วน)
     google_ready = GOOGLE_ENABLED and vision_service is not None
-    google_usage = read_google_usage(drive_service) if google_ready else None
+    google_usage = read_google_usage(sheet_service) if google_ready else None
     if google_usage is not None:
         print(f"🔢 โควตา Gemini วันนี้: flash {google_usage['flash']}/{GEMINI_DAILY_LIMIT}, "
               f"flash_lite {google_usage['flash_lite']}/{GEMINI_DAILY_LIMIT} | "
@@ -640,27 +672,32 @@ def process_cycle(drive_service, sheet_service, vision_service, manual=False):
             image_bytes = _compress_image(raw) if "image" in mime_type else raw
 
             bill, engine = analyze_with_best_engine(
-                vision_service, image_bytes, mime_type, drive_service, google_usage, doc_counter)
+                vision_service, image_bytes, mime_type, sheet_service, google_usage, doc_counter)
             print(f"  🤖 ใช้เครื่องยนต์: {engine}")
             if not bill.get("is_valid_bill"):
                 print("  ⚠️ ไม่ใช่บิล -> Error")
                 move_file(drive_service, file_id, FOLDER_ERROR)
+                note = bill.get("note") or "อ่านไม่ออก/ไม่ใช่เอกสารบัญชี"
+                notify_telegram(f"⚠️ (Cloud Run) ไม่ใช่บิล[{idx}/{total}] {file_name} "
+                                f"-> ย้ายเข้า Error ({note}) [{engine}]")
                 error += 1
                 continue
 
             recorded_month = datetime.now().strftime("%Y-%m")
             drive_link = f"https://drive.google.com/file/d/{file_id}/view"
+            file_elapsed = int((datetime.now() - file_start).total_seconds())
+            processed_at = (datetime.now() + timedelta(hours=QUOTA_TZ_OFFSET)).strftime("%Y-%m-%d %H:%M:%S")
             row = [
                 bill.get("date"), recorded_month, bill.get("bill_type"), bill.get("invoice_no"),
                 bill.get("seller_name"), bill.get("seller_address"), bill.get("buyer_name"),
                 bill.get("buyer_address"), bill.get("items_summary"), bill.get("subtotal"),
                 bill.get("vat"), bill.get("total"), bill.get("confidence"), bill.get("note"), drive_link,
+                processed_at, engine, file_elapsed,
             ]
             append_to_sheet(sheet_service, SPREADSHEET_ID, SHEET_TAB_NAME, row)
             target = get_or_create_monthly_folder(drive_service, FOLDER_SUCCESS, recorded_month)
             move_file(drive_service, file_id, target)
             print(f"  ✅ สำเร็จ -> Success/{recorded_month}/")
-            file_elapsed = int((datetime.now() - file_start).total_seconds())
             notify_telegram(f"✅ (Cloud Run)สแกนบิลสำเร็จ[{idx}/{total}] {file_name} "
                             f"ใช้เวลา {file_elapsed} วินาที [{engine}]")
             success += 1
@@ -694,6 +731,8 @@ def process_cycle(drive_service, sheet_service, vision_service, manual=False):
                 continue
 
             move_file(drive_service, file_id, FOLDER_ERROR)
+            notify_telegram(f"❌ (Cloud Run) สแกนล้มเหลว[{idx}/{total}] {file_name} "
+                            f"-> ย้ายเข้า Error\nสาเหตุ: {err}")
             error += 1
 
     end_time = datetime.now()
@@ -726,6 +765,7 @@ def _services():
             except Exception as e:
                 print(f"⚠️ สร้าง Vision client ไม่ได้ (จะใช้ Typhoon ล้วน): {e}")
                 _VISION = None
+            ensure_quota_tab(_SHEET)   # แท็บเก็บตัวนับโควตา (SA สร้างแท็บในชีตเดิมได้ ไม่ติด storage quota)
         check_and_create_headers(_SHEET, SPREADSHEET_ID, SHEET_TAB_NAME)
     return _DRIVE, _SHEET, _VISION
 

@@ -1,0 +1,18 @@
+# Config / secrets loading
+python-dotenv==1.2.2
+
+# Image resize / compression before OCR
+pillow==11.1.0
+
+# Google Drive & Sheets
+google-api-python-client==2.197.0
+google-auth==2.53.0
+
+# Stage 1 — Google Cloud Vision (OCR / document text detection)
+google-cloud-vision==3.14.0
+
+# Stage 2 — Gemini (structures the OCR text into JSON)
+google-genai==2.8.0
+
+# Structured JSON output schema (response_schema)
+pydantic==2.10.6
