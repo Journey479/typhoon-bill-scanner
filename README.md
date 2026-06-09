@@ -12,14 +12,16 @@
 
 | ลำดับ | เครื่องยนต์ | โควตา | นับที่ |
 |---|---|---|---|
-| 1 | Google Vision OCR + **Gemini 2.5 Flash** | 20 ไฟล์/วัน | `_google_usage.json` |
-| 2 | Google Vision OCR + **Gemini 2.5 Flash-Lite** | 20 ไฟล์/วัน (รวม 40/วัน) | `_google_usage.json` |
+| 1 | Google Vision OCR + **Gemini 2.5 Flash** | 20 ไฟล์/วัน | แท็บ `_QuotaState` ในชีต |
+| 2 | Google Vision OCR + **Gemini 2.5 Flash-Lite** | 20 ไฟล์/วัน (รวม 40/วัน) | แท็บ `_QuotaState` ในชีต |
 | 3 | **Typhoon** OCR + LLM | ไม่จำกัด | — |
 
 - ตัวนับ Gemini **รีเซ็ตทุกวันตอน 07:00** (ปรับได้ที่ `GOOGLE_QUOTA_RESET_HOUR` / `GOOGLE_QUOTA_TZ_OFFSET`)
 - **Vision จำกัด 1,000 หน้า/เดือน** (`VISION_MONTHLY_LIMIT`) กันทะลุโควตาฟรี — ครบแล้วสลับไป Typhoon ทันที (รีเซ็ตต้นเดือน)
 - Vision ใช้สิทธิ์ **Service Account** ของ Cloud Run (ADC) — ไม่ต้องมี API key/ไฟล์ JSON ; **Gemini** ใช้ API key
 - ไม่ตั้ง `GEMINI_API_KEY` = ข้าม Google ใช้ **Typhoon ล้วน** ได้เลย
+- **Gemini 503 (โหลดหนักชั่วคราว) ไม่เด้งไป Typhoon ทันที** — retry โมเดลเดิม (`GEMINI_MAX_ATTEMPTS`, backoff `GEMINI_RETRY_BACKOFF` วินาที) แล้วลองโมเดลถัดไป ก่อนค่อย fallback (ต่างจาก 429/quota ที่มาร์กโมเดลเต็มวันทันที)
+- ตัวนับโควตาเก็บใน **แท็บ `_QuotaState`** ของ Google Sheet (เซลล์ A1 = JSON) ไม่ใช่ไฟล์ Drive เพราะ **Service Account สร้างไฟล์ใหม่ใน My Drive ไม่ได้** (`storageQuotaExceeded`) แต่แก้ชีต/เพิ่มแท็บที่มีอยู่แล้วได้ปกติ — แท็บถูกสร้างอัตโนมัติรอบแรก
 
 ## 📁 ไฟล์ในโปรเจกต์
 
@@ -122,6 +124,12 @@ Copy-Item env.example.yaml env.yaml
 ผลการสแกนแต่ละไฟล์ถูก **broadcast ไปทุกแชทใน allowlist** พร้อมเวลาที่ใช้ + เครื่องยนต์ที่ใช้
 (เช่น `✅ สแกนบิลสำเร็จ[2/5] ... ใช้เวลา 18 วินาที [Google/gemini-2.5-flash]`)
 
+**กรณีล้มเหลวก็แจ้งกลับด้วย** — ไฟล์ที่ถูกย้ายเข้า Error folder จะ broadcast เหตุผลให้ทราบทันที:
+- `⚠️ ไม่ใช่บิล[..] ... -> ย้ายเข้า Error (เหตุผล)` — เอกสารอ่านไม่ออก/ไม่ใช่เอกสารบัญชี
+- `❌ สแกนล้มเหลว[..] ... -> ย้ายเข้า Error` พร้อมข้อความ error — ข้อผิดพลาดอื่น ๆ
+
+(หมายเหตุ: กรณี rate-limit/timeout ที่ระบบวนไฟล์กลับ Inbox เพื่อลองใหม่รอบหน้าจะ **ไม่** แจ้ง เพื่อกันสแปม)
+
 ## 🔧 อัปเดตภายหลัง
 
 | แก้อะไร | ต้องทำ |
@@ -140,4 +148,7 @@ Copy-Item env.example.yaml env.yaml
 - **ไฟล์ที่เข้า Drive โดยตรง (ไม่ผ่าน Telegram)** จะไม่ถูกยิงอัตโนมัติ — พิมพ์ `run` หรือเปิด Cloud Scheduler (ดูท้าย `deploy.ps1`) เป็น safety-net
 - **PDF:** Vision อ่าน inline ได้สูงสุด 5 หน้า/ไฟล์ ; ไฟล์ใหญ่กว่านั้นให้แยกก่อน
 - ไฟล์สถานะบน Drive (เก็บในโฟลเดอร์ Success เพราะ worker ไม่สแกน): `_autorun_state.txt`,
-  `_google_usage.json` (ตัวนับโควตา), `_telegram_chats.txt` (allowlist)
+  `_telegram_chats.txt` (allowlist) — เขียนโดย code.gs (รันในนามผู้ใช้) ส่วน worker (SA) อ่าน/แก้
+- **ตัวนับโควตา** ย้ายมาเก็บใน **แท็บ `_QuotaState`** ของ Google Sheet (ไม่ใช่ไฟล์ Drive) เพราะ SA สร้างไฟล์ใหม่ใน My Drive ไม่ได้ — สร้างแท็บอัตโนมัติรอบแรก ไม่ต้องแตะ
+- **คอลัมน์ในชีต Raw_Data:** นอกจากข้อมูลบิล มี 3 คอลัมน์ท้าย — `เวลาที่บันทึก` (เวลาไทย), `โมเดลที่ประมวลผล`, `เวลาที่ใช้ประมวลผล (วินาที)`
+  > ⚠️ ชีตที่ใช้งานอยู่ก่อนเพิ่มฟีเจอร์นี้ ระบบ **ไม่เขียนทับหัวคอลัมน์เดิม** — เติมหัว `P1/Q1/R1` เองครั้งเดียว (แถวข้อมูลใหม่จะกรอกครบทุกคอลัมน์เอง)
