@@ -19,6 +19,9 @@ README.md
 *.gs
 *.template
 
+# Colab fallback notebook (รันบน Colab เท่านั้น — ไม่ต้องเข้า container)
+*.ipynb
+
 # โฟลเดอร์อ้างอิง (local reference เท่านั้น — มี SA key อยู่ข้างใน ห้ามขึ้น build)
 Google Vision code/
 

@@ -29,6 +29,7 @@
 |---|---|---|
 | `main.py` | worker หลัก — entry point `scan(request)` | ✅ (ไม่มีความลับ) |
 | `requirements.txt` | ไลบรารีสำหรับ buildpacks | ✅ |
+| `colab_fallback.ipynb` | Colab notebook สำรอง — import `main.py` โพลล์ Inbox แทนตอน Cloud Run ล่ม | ✅ |
 | `deploy.ps1` | สคริปต์ deploy (อ่านค่าจาก `env.yaml`, ดันความลับเข้า Secret Manager) | ✅ |
 | `env.example.yaml` | เทมเพลตค่าตัวแปร → copy เป็น `env.yaml` แล้วเติมค่า | ✅ |
 | `code.gs.template` | Apps Script (Telegram webhook) → วางใน Apps Script editor | ✅ |
@@ -137,6 +138,19 @@ Copy-Item env.example.yaml env.yaml
 > ⚠️ ต้องรัน **`setupBillDeeTrigger()` หนึ่งครั้ง** ใน Apps Script editor เพื่อติดตั้ง onEdit trigger (ผูกกับสเปรดชีต — จำเป็นเพราะ simple trigger เข้าถึง DriveApp ไม่ได้)
 
 (หมายเหตุ: กรณี rate-limit/timeout ที่ระบบวนไฟล์กลับ Inbox เพื่อลองใหม่รอบหน้าจะ **ไม่** แจ้ง เพื่อกันสแปม)
+
+## 🛟 Fallback ด้วย Google Colab (ตอน Cloud Run ล่ม)
+
+ถ้า Cloud Run ดับ/ปิด ใช้ **`colab_fallback.ipynb`** รันไปป์ไลน์เดิมบน Colab แทนได้ทันที — notebook นี้ **import `main.py` ตัวเดียวกัน** จึงได้ตรรกะตรงกันเป๊ะ (โฟลเดอร์รายเดือน, แท็บ Error/บิลดี, ตัวนับโควตา, แจ้ง Telegram) ต่างกันแค่ **โพลล์ Inbox เป็นระยะ** แทน event-driven และใช้ **Service Account JSON key** (เก็บใน **Colab Secrets** หรือ **Google Drive** ครั้งเดียว — ไม่ต้องอัปโหลดทุกครั้ง) แทน ADC ของ Cloud Run
+
+**วิธีใช้:** เปิด `colab_fallback.ipynb` ใน Colab → รันเซลล์ 1→7 ตามลำดับ (ติดตั้งไลบรารี → โหลด SA key จาก Colab Secrets/Drive → กรอกค่าตรง `env.yaml` → อัปโหลด `main.py` → ทดสอบเชื่อมต่อ → รันครั้งเดียว หรือเปิดลูปโพลล์)
+
+> 💡 **ไม่ต้องอัป JSON ทุกครั้ง:** เซลล์ที่ 2 ลอง **Colab Secrets** ก่อน (เพิ่ม secret `SA_JSON` ครั้งเดียว วางเนื้อ JSON ทั้งก้อน — ผูกกับบัญชี ใช้ได้ทุก notebook) ถ้าไม่มีจะ fallback ไป mount **Google Drive** (เก็บไฟล์ key ไว้ครั้งเดียว ตั้ง path ที่ `DRIVE_KEY_PATH`)
+
+- เคารพสวิตช์ **`autorun:on/off`** เดียวกับ Telegram (สั่งจากบอทได้ปกติ)
+- ไฟล์ใหม่ยังเข้า Inbox ผ่าน Telegram → code.gs ได้ตามปกติ (code.gs เป็น Apps Script แยกจาก Cloud Run) — Colab จะกวาดให้เอง
+- ⚠️ **อย่ารัน Colab พร้อม Cloud Run** — ทั้งคู่เรียก `reset_processing_to_inbox()` ต้นรอบ จะแย่งไฟล์กันจนประมวลผล/บันทึกซ้ำ ใช้ Colab เฉพาะตอน Cloud Run ดับเท่านั้น
+- ความลับ (key/token/IDs) กรอกในเซลล์ Colab ตอนรัน — **ไม่ถูกบันทึกลงไฟล์ `.ipynb`** ที่ commit
 
 ## 🔧 อัปเดตภายหลัง
 
