@@ -121,10 +121,11 @@ HEADERS = [
     "เวลาที่บันทึก", "โมเดลที่ประมวลผล", "เวลาที่ใช้ประมวลผล (วินาที)",
 ]
 
-# หัวข้อแท็บ Error — เอกสารที่สแกนไม่ผ่าน (อ่านไม่ออก/ไม่ใช่บิล/ระบบล้มเหลว) เก็บไว้ให้คนกรอกเองต่อได้
+# หัวคอลัมน์แท็บ Error (อยู่ "แถว 2" — แถว 1 เป็นแถวควบคุม "ย้ายเข้าบิลดี" + Dropdown Yes/No)
+# A = บิลดี (checkbox) ; ที่เหลือ = ข้อมูลที่ยกขึ้น Raw_Data ได้เมื่อยืนยันว่าเป็น "บิลดี"
 ERROR_HEADERS = [
-    "ชื่อไฟล์", "ประเภทบิล", "รายละเอียดของError", "ลิงก์รูปภาพใน Drive",
-    "TimeStamp", "Model", "เวลาที่ใช้ประมวลผล (วินาที)",
+    "บิลดี", "หมายเหตุ", "ลิงก์รูปภาพใน Drive",
+    "เวลาที่บันทึก", "โมเดลที่ประมวลผล", "เวลาที่ใช้ประมวลผล (วินาที)",
 ]
 
 # GLOBAL: คีย์ปัจจุบัน + client (วนใหม่ต่อเอกสาร)
@@ -369,16 +370,80 @@ def ensure_quota_tab(sheet_service):
     ensure_sheet_tab(sheet_service, QUOTA_SHEET_TAB)
 
 
-def log_error_to_sheet(sheet_service, file_name, bill_type, error_detail, drive_link, model, elapsed):
-    """บันทึก 1 แถวลงแท็บ Error (สร้าง/เติมหัวข้อให้อัตโนมัติ) — เผื่อคนมากรอกรายละเอียดเองต่อ
+def get_sheet_id(sheet_service, tab_name):
+    """คืน sheetId (gid) ของแท็บ — ใช้กับ batchUpdate ที่อ้าง GridRange (เช่น ตั้ง data validation)"""
+    meta = sheet_service.spreadsheets().get(
+        spreadsheetId=SPREADSHEET_ID, fields="sheets.properties(sheetId,title)").execute()
+    for s in meta.get("sheets", []):
+        if s["properties"]["title"] == tab_name:
+            return s["properties"]["sheetId"]
+    return None
+
+
+def ensure_error_tab_layout(sheet_service):
+    """ตั้งโครงแท็บ Error ครั้งเดียว (ทำงานเมื่อ A2 ยังว่าง):
+        แถว 1 = ตัวควบคุม  B1 = 'ย้ายเข้าบิลดี', C1 = Dropdown Yes/No (ค่าเริ่ม No)
+        แถว 2 = หัวคอลัมน์ (ERROR_HEADERS)
+    หมายเหตุ: checkbox คอลัมน์ A ใส่ "ทีละแถว" ตอนมีข้อมูลใหม่ (ดู log_error_to_sheet)
+    ไม่ใส่ทั้งคอลัมน์ เพราะจะทำให้ทุกเซลล์มีค่า FALSE -> นับแถวเพี้ยน + checkbox โผล่ทุกแถวว่าง
+    การ์ดด้วย try/except — ตั้งไม่ได้ก็ไม่ทำให้รอบประมวลผลพัง"""
+    try:
+        res = sheet_service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID, range=f"{ERROR_SHEET_TAB}!A2").execute()
+        if res.get("values"):
+            return   # ตั้งหัวคอลัมน์ไว้แล้ว -> ข้าม
+        sheet_id = get_sheet_id(sheet_service, ERROR_SHEET_TAB)
+        # 1) ข้อความ: B1 label, C1 = No, หัวคอลัมน์ A2:F2
+        sheet_service.spreadsheets().values().batchUpdate(
+            spreadsheetId=SPREADSHEET_ID,
+            body={"valueInputOption": "USER_ENTERED", "data": [
+                {"range": f"{ERROR_SHEET_TAB}!B1", "values": [["ย้ายเข้าบิลดี"]]},
+                {"range": f"{ERROR_SHEET_TAB}!C1", "values": [["No"]]},
+                {"range": f"{ERROR_SHEET_TAB}!A2", "values": [ERROR_HEADERS]},
+            ]}).execute()
+        if sheet_id is not None:
+            # 2) data validation: dropdown Yes/No ที่ C1 (checkbox ใส่ทีละแถวใน log_error_to_sheet)
+            sheet_service.spreadsheets().batchUpdate(
+                spreadsheetId=SPREADSHEET_ID,
+                body={"requests": [
+                    {"setDataValidation": {
+                        "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1,
+                                  "startColumnIndex": 2, "endColumnIndex": 3},
+                        "rule": {"condition": {"type": "ONE_OF_LIST", "values": [
+                            {"userEnteredValue": "Yes"}, {"userEnteredValue": "No"}]},
+                            "strict": True, "showCustomUi": True}}},
+                ]}).execute()
+        print(f"🆕 ตั้งโครงแท็บ {ERROR_SHEET_TAB} (แถวควบคุม + dropdown) แล้ว")
+    except Exception as e:
+        print(f"⚠️ ตั้งโครงแท็บ {ERROR_SHEET_TAB} ไม่ได้: {e}")
+
+
+def log_error_to_sheet(sheet_service, note, drive_link, model, elapsed):
+    """บันทึก 1 แถวลงแท็บ Error ตามโครงใหม่: [บิลดี(checkbox), หมายเหตุ, ลิงก์, เวลาบันทึก, โมเดล, เวลาประมวลผล]
+    คอลัมน์ A เริ่มไม่ติ๊ก — เผื่อคนเปิดดูรูปแล้วยืนยันเป็น 'บิลดี' ภายหลัง (code.gs จะย้ายขึ้น Raw_Data ให้)
     ห้ามให้ความล้มเหลวของการ log มาทำให้รอบประมวลผลพัง จึง try/except ครอบทั้งหมด"""
     try:
         ensure_sheet_tab(sheet_service, ERROR_SHEET_TAB)
-        check_and_create_headers(sheet_service, SPREADSHEET_ID, ERROR_SHEET_TAB, ERROR_HEADERS)
+        ensure_error_tab_layout(sheet_service)
         timestamp = (datetime.now() + timedelta(hours=QUOTA_TZ_OFFSET)).strftime("%Y-%m-%d %H:%M:%S")
-        row = [file_name, bill_type or "", error_detail or "", drive_link,
-               timestamp, model or "", elapsed]
-        append_to_sheet(sheet_service, SPREADSHEET_ID, ERROR_SHEET_TAB, row)
+        row = [False, note or "", drive_link, timestamp, model or "", elapsed]
+        # ข้อมูลเริ่มแถว 3 — นับแถวที่มีอยู่จากคอลัมน์ A (แต่ละแถวข้อมูลมีค่า checkbox อยู่แล้ว
+        # และไม่มี checkbox ทั้งคอลัมน์ จึงนับเฉพาะแถวข้อมูลจริง ไม่เพี้ยน)
+        existing = sheet_service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID, range=f"{ERROR_SHEET_TAB}!A3:A").execute().get("values", [])
+        next_row = 3 + len(existing)
+        sheet_service.spreadsheets().values().update(
+            spreadsheetId=SPREADSHEET_ID, range=f"{ERROR_SHEET_TAB}!A{next_row}",
+            valueInputOption="USER_ENTERED", body={"values": [row]}).execute()
+        # ใส่ checkbox เฉพาะ "แถวนี้แถวเดียว" (ไม่ทำทั้งคอลัมน์ -> กันนับแถวเพี้ยน + checkbox โผล่แถวว่าง)
+        sheet_id = get_sheet_id(sheet_service, ERROR_SHEET_TAB)
+        if sheet_id is not None:
+            sheet_service.spreadsheets().batchUpdate(
+                spreadsheetId=SPREADSHEET_ID,
+                body={"requests": [{"setDataValidation": {
+                    "range": {"sheetId": sheet_id, "startRowIndex": next_row - 1, "endRowIndex": next_row,
+                              "startColumnIndex": 0, "endColumnIndex": 1},
+                    "rule": {"condition": {"type": "BOOLEAN"}, "strict": True, "showCustomUi": True}}}]}).execute()
     except Exception as e:
         print(f"⚠️ บันทึกแท็บ {ERROR_SHEET_TAB} ไม่ได้: {e}")
 
@@ -704,12 +769,13 @@ def process_cycle(drive_service, sheet_service, vision_service, manual=False):
             print(f"  🤖 ใช้เครื่องยนต์: {engine}")
             if not bill.get("is_valid_bill"):
                 print("  ⚠️ ไม่ใช่บิล -> Error")
-                move_file(drive_service, file_id, FOLDER_ERROR)
+                error_month = datetime.now().strftime("%Y-%m")
+                error_target = get_or_create_monthly_folder(drive_service, FOLDER_ERROR, error_month)
+                move_file(drive_service, file_id, error_target)
                 note = bill.get("note") or "อ่านไม่ออก/ไม่ใช่เอกสารบัญชี"
                 drive_link = f"https://drive.google.com/file/d/{file_id}/view"
                 file_elapsed = int((datetime.now() - file_start).total_seconds())
-                log_error_to_sheet(sheet_service, file_name, bill.get("bill_type"),
-                                   note, drive_link, engine, file_elapsed)
+                log_error_to_sheet(sheet_service, note, drive_link, engine, file_elapsed)
                 notify_telegram(f"⚠️ (Cloud Run) ไม่ใช่บิล[{idx}/{total}] {file_name} "
                                 f"-> ย้ายเข้า Error ({note}) [{engine}]")
                 error += 1
@@ -762,10 +828,12 @@ def process_cycle(drive_service, sheet_service, vision_service, manual=False):
                 print("  ⏳ timeout -> กลับ Inbox (รอบหน้าลองใหม่)")
                 continue
 
-            move_file(drive_service, file_id, FOLDER_ERROR)
+            error_month = datetime.now().strftime("%Y-%m")
+            error_target = get_or_create_monthly_folder(drive_service, FOLDER_ERROR, error_month)
+            move_file(drive_service, file_id, error_target)
             drive_link = f"https://drive.google.com/file/d/{file_id}/view"
             file_elapsed = int((datetime.now() - file_start).total_seconds())
-            log_error_to_sheet(sheet_service, file_name, None, err, drive_link, None, file_elapsed)
+            log_error_to_sheet(sheet_service, err, drive_link, None, file_elapsed)
             notify_telegram(f"❌ (Cloud Run) สแกนล้มเหลว[{idx}/{total}] {file_name} "
                             f"-> ย้ายเข้า Error\nสาเหตุ: {err}")
             error += 1
@@ -802,8 +870,8 @@ def _services():
                 _VISION = None
             ensure_quota_tab(_SHEET)   # แท็บเก็บตัวนับโควตา (SA สร้างแท็บในชีตเดิมได้ ไม่ติด storage quota)
         check_and_create_headers(_SHEET, SPREADSHEET_ID, SHEET_TAB_NAME)
-        ensure_sheet_tab(_SHEET, ERROR_SHEET_TAB)   # แท็บ Error (สร้างล่วงหน้า + เติมหัวข้อ)
-        check_and_create_headers(_SHEET, SPREADSHEET_ID, ERROR_SHEET_TAB, ERROR_HEADERS)
+        ensure_sheet_tab(_SHEET, ERROR_SHEET_TAB)   # แท็บ Error (สร้างล่วงหน้า)
+        ensure_error_tab_layout(_SHEET)             # แถวควบคุม + หัวคอลัมน์(แถว2) + checkbox/dropdown
     return _DRIVE, _SHEET, _VISION
 
 

@@ -31,6 +31,12 @@ const AUTORUN_FILE    = "_autorun_state.txt";
 const CHATS_FILE      = "_telegram_chats.txt";   // allowlist: chat id ที่อนุมัติ (main.py broadcast เฉพาะรายชื่อนี้)
 const ADMIN_CHAT_IDS  = cfg("ADMIN_CHAT_IDS");   // แอดมิน (คั่นด้วย ,) — เพิ่ม/ถอนสิทธิ์ได้ และรับ broadcast เสมอ
 
+// --- ฟีเจอร์ "ย้ายเข้าบิลดี" (แท็บ Error) — ต้องตรงกับ main.py / env.yaml ---
+const ERROR_TAB_NAME       = "Error";       // ชื่อแท็บ Error (= ERROR_SHEET_TAB ใน main.py)
+const RAW_DATA_TAB_NAME    = "Raw_Data";    // ชื่อแท็บข้อมูลหลัก (= SHEET_TAB_NAME ใน env.yaml)
+const ERROR_DATA_START_ROW = 3;             // แถว 1 = ตัวควบคุม, แถว 2 = หัวคอลัมน์, ข้อมูลเริ่มแถว 3
+const ERROR_TRIGGER_CELL   = "C1";          // เซลล์ Dropdown Yes/No
+
 // =========================
 // SETUP — เติมค่าจริงแล้วรันครั้งเดียวเพื่อบันทึกเข้า Script Properties (จากนั้นลบค่าออกได้)
 // (หรือกรอกมือที่ Project Settings → Script properties ก็ได้ ไม่ต้องใช้ฟังก์ชันนี้)
@@ -155,7 +161,7 @@ function doPost(e) {
     }
     if (cmd === "mve") {
       const np = moveAllFiles(PROCESSING_FOLDER_ID, INBOX_FOLDER_ID);
-      const ne = moveAllFiles(ERROR_FOLDER_ID, INBOX_FOLDER_ID);
+      const ne = moveFilesRecursive(ERROR_FOLDER_ID, INBOX_FOLDER_ID);   // ลงไปดึงในโฟลเดอร์รายเดือนด้วย
       sendMessage(chatId,
         "🔄 ดึงไฟล์กลับเข้า Inbox เรียบร้อย\n" +
         "⚡ Processing: " + np + " ไฟล์\n" +
@@ -340,9 +346,33 @@ function moveAllFiles(srcFolderId, destFolderId) {
   return n;
 }
 
+// เหมือน moveAllFiles แต่ลงไปในโฟลเดอร์ย่อย (รายเดือน) ด้วย — ใช้กับ Error/YYYY-MM/
+function moveFilesRecursive(srcFolderId, destFolderId) {
+  const dest = DriveApp.getFolderById(destFolderId);
+  const src = DriveApp.getFolderById(srcFolderId);
+  let n = 0;
+  const files = src.getFiles();
+  while (files.hasNext()) { files.next().moveTo(dest); n++; }
+  const subs = src.getFolders();
+  while (subs.hasNext()) { n += moveFilesRecursive(subs.next().getId(), destFolderId); }
+  return n;
+}
+
 function getSuccessMonthInfo() {
   const monthStr = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM");
   const subs = DriveApp.getFolderById(SUCCESS_FOLDER_ID).getFoldersByName(monthStr);
+  let count = 0;
+  if (subs.hasNext()) {
+    const files = subs.next().getFiles();
+    while (files.hasNext()) { files.next(); count++; }
+  }
+  return { month: monthStr, count: count };
+}
+
+// Error เก็บแยกรายเดือนแล้ว (เหมือน Success) — นับไฟล์ในโฟลเดอร์เดือนปัจจุบัน
+function getErrorMonthInfo() {
+  const monthStr = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM");
+  const subs = DriveApp.getFolderById(ERROR_FOLDER_ID).getFoldersByName(monthStr);
   let count = 0;
   if (subs.hasNext()) {
     const files = subs.next().getFiles();
@@ -369,10 +399,11 @@ function buildLinks() {
 
 function buildShowReport() {
   const s = getSuccessMonthInfo();
+  const e = getErrorMonthInfo();
   return "📊 รายงานไฟล์ใน Google Drive\n" +
          "📥 Inbox: " + countFiles(INBOX_FOLDER_ID) + " ไฟล์\n" +
          "⚡ Processing: " + countFiles(PROCESSING_FOLDER_ID) + " ไฟล์\n" +
-         "❌ Error: " + countFiles(ERROR_FOLDER_ID) + " ไฟล์\n" +
+         "❌ Error (" + e.month + "): " + e.count + " ไฟล์\n" +
          "✅ Success (" + s.month + "): " + s.count + " ไฟล์";
 }
 
@@ -394,6 +425,125 @@ function buildHelp() {
          "✅ allow <chat id> → อนุมัติแชทใหม่\n" +
          "🚫 revoke <chat id> → ถอนสิทธิ์แชท\n" +
          "👥 chats → ดูรายชื่อแอดมิน/แชทที่อนุมัติ";
+}
+
+// =========================
+// ฟีเจอร์ "ย้ายเข้าบิลดี" — ติ๊ก checkbox (คอลัมน์ A) แถวที่อ่านออกแล้วในแท็บ Error
+// แล้วสลับ Dropdown C1 เป็น "Yes" -> ย้ายไฟล์ Error → Success/YYYY-MM/ + ยกข้อมูลขึ้น Raw_Data
+// (ความน่าเชื่อถือ = 00) -> ลบแถวออกจาก Error -> รีเซ็ต Dropdown กลับ "No"
+// ▶️ รัน setupBillDeeTrigger() "หนึ่งครั้ง" เพื่อติดตั้ง onEdit trigger ผูกกับสเปรดชีต
+//    (onEdit แบบ installable จำเป็น เพราะสคริปต์นี้แยกจากชีต + ต้องใช้สิทธิ์ DriveApp)
+// =========================
+function setupBillDeeTrigger() {
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === "onErrorSheetEdit") ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger("onErrorSheetEdit").forSpreadsheet(SPREADSHEET_ID).onEdit().create();
+  Logger.log("ติดตั้ง onEdit trigger (onErrorSheetEdit) เรียบร้อย");
+}
+
+function onErrorSheetEdit(e) {
+  try {
+    if (!e || !e.range) return;
+    const sheet = e.range.getSheet();
+    if (sheet.getName() !== ERROR_TAB_NAME) return;
+    if (e.range.getA1Notation() !== ERROR_TRIGGER_CELL) return;   // สนใจเฉพาะเซลล์ Dropdown C1
+    if (String(e.value || "").trim().toLowerCase() !== "yes") return;
+    promoteCheckedErrorRows(sheet);
+  } catch (err) {
+    Logger.log("onErrorSheetEdit error: " + err);
+    notifyAdmins("⚠️ ย้ายเข้าบิลดีล้มเหลว: " + err);
+  }
+}
+
+function promoteCheckedErrorRows(errorSheet) {
+  const ss = errorSheet.getParent();
+  const rawSheet = ss.getSheetByName(RAW_DATA_TAB_NAME);
+  const lastRow = errorSheet.getLastRow();
+  const movedRows = [];
+  let moved = 0;
+
+  if (lastRow >= ERROR_DATA_START_ROW) {
+    const numRows = lastRow - ERROR_DATA_START_ROW + 1;
+    // A..F = บิลดี(checkbox), หมายเหตุ, ลิงก์รูปภาพ, เวลาที่บันทึก, โมเดล, เวลาประมวลผล
+    const data = errorSheet.getRange(ERROR_DATA_START_ROW, 1, numRows, 6).getValues();
+
+    for (let i = 0; i < data.length; i++) {
+      if (data[i][0] !== true) continue;   // ไม่ติ๊ก -> ข้าม
+      const note    = data[i][1];
+      const link    = data[i][2];
+      const savedAt = data[i][3];
+      const model   = data[i][4];
+      const elapsed = data[i][5];
+      const month   = monthFromTimestamp(savedAt);
+
+      // 1) ย้ายไฟล์ Error -> Success/<month>/ (หา file id จากลิงก์)
+      const fileId = extractDriveId(link);
+      if (fileId) {
+        try {
+          DriveApp.getFileById(fileId).moveTo(getOrCreateMonthlyFolder(SUCCESS_FOLDER_ID, month));
+        } catch (mErr) {
+          Logger.log("ย้ายไฟล์ " + fileId + " ไม่ได้: " + mErr);
+        }
+      }
+
+      // 2) ยกข้อมูลขึ้น Raw_Data (18 คอลัมน์ — ฟิลด์บิลเว้นว่าง, ความน่าเชื่อถือ = 00)
+      if (rawSheet) {
+        const row = [];
+        for (let c = 0; c < 18; c++) row.push("");
+        row[1]  = month;     // เดือนที่บันทึก
+        row[12] = 0;         // ความน่าเชื่อถือ(%) -> ตั้ง number format "00" ให้แสดงเป็น 00
+        row[13] = note;      // หมายเหตุ
+        row[14] = link;      // ลิงก์รูปภาพใน Drive
+        row[15] = savedAt;   // เวลาที่บันทึก
+        row[16] = model;     // โมเดลที่ประมวลผล
+        row[17] = elapsed;   // เวลาที่ใช้ประมวลผล (วินาที)
+        rawSheet.appendRow(row);
+        rawSheet.getRange(rawSheet.getLastRow(), 13).setNumberFormat("00");
+      }
+
+      movedRows.push(ERROR_DATA_START_ROW + i);
+      moved++;
+    }
+
+    // 3) ลบแถวที่ย้ายแล้วออกจาก Error (ลบจากล่างขึ้นบน กัน index เพี้ยน)
+    movedRows.sort(function (a, b) { return b - a; });
+    movedRows.forEach(function (r) { errorSheet.deleteRow(r); });
+  }
+
+  // 4) รีเซ็ต Dropdown กลับ No เสมอ (พร้อมเริ่มรอบใหม่)
+  errorSheet.getRange(ERROR_TRIGGER_CELL).setValue("No");
+  SpreadsheetApp.flush();
+
+  // 5) แจ้งผลทาง Telegram
+  notifyAdmins(moved > 0
+    ? "✅ ย้าย " + moved + " บิลจาก Error → Success/บิลดี เรียบร้อย (ความน่าเชื่อถือ = 00)"
+    : "ℹ️ ไม่พบแถวที่ติ๊ก 'บิลดี' — รีเซ็ต Dropdown กลับ No แล้ว");
+}
+
+function monthFromTimestamp(ts) {
+  if (ts instanceof Date) return Utilities.formatDate(ts, Session.getScriptTimeZone(), "yyyy-MM");
+  const m = String(ts || "").match(/(\d{4})-(\d{2})/);
+  if (m) return m[1] + "-" + m[2];
+  return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM");
+}
+
+function extractDriveId(link) {
+  const s = String(link || "");
+  let m = s.match(/\/d\/([a-zA-Z0-9_-]+)/);
+  if (m) return m[1];
+  m = s.match(/[?&]id=([a-zA-Z0-9_-]+)/);
+  return m ? m[1] : "";
+}
+
+function getOrCreateMonthlyFolder(parentFolderId, monthName) {
+  const parent = DriveApp.getFolderById(parentFolderId);
+  const subs = parent.getFoldersByName(monthName);
+  return subs.hasNext() ? subs.next() : parent.createFolder(monthName);
+}
+
+function notifyAdmins(text) {
+  getAdminIds().forEach(function (id) { sendMessage(id, text); });
 }
 
 // =========================
